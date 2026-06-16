@@ -1,0 +1,66 @@
+name: release
+
+# Publish rostdown to crates.io via Trusted Publishing (OIDC) — no
+# long-lived CARGO_REGISTRY_TOKEN secret is stored anywhere. crates.io
+# mints a short-lived, crate-scoped token from THIS workflow's OIDC
+# identity at publish time.
+#
+# === One-time setup on crates.io (required before this can publish) ===
+# On the crate page → Settings → Trusted Publishing → "Add", enter:
+#     Repository owner:   momiji-rs
+#     Repository name:    rostdown
+#     Workflow filename:  release.yml      (this file's name)
+#     Environment:        release          (must match `environment:` below)
+# The crate must already exist and be owned by your crates.io account
+# before a trusted publisher can be added (publish v0.0.0 once with a
+# classic token, or claim ownership, to bootstrap).
+#
+# NOTE: the name `rostdown` on crates.io is currently held by an
+# UNRELATED crate. Until that is resolved (gain ownership, or rename this
+# crate), `cargo publish` here will be rejected — the workflow is ready,
+# the name is the blocker.
+
+on:
+  # Cut a release from the GitHub UI (or push a release) to publish.
+  release:
+    types: [published]
+  # Manual trigger for re-runs / first publish.
+  workflow_dispatch:
+
+# Avoid two publishes racing (e.g. a release + a manual dispatch).
+concurrency:
+  group: release-crates-io
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: cargo publish (crates.io, OIDC)
+    runs-on: ubuntu-latest
+    # The environment scopes the OIDC identity and lets you add required
+    # reviewers / protection rules. It MUST match the environment named in
+    # the crates.io trusted-publisher config above.
+    environment: release
+    permissions:
+      # Required: lets the job mint an OIDC token for the auth action.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Gate the publish on the same contract CI enforces: the default
+      # build stays zero-dep & unsafe-free and the golden corpus passes.
+      - name: Verify (default features)
+        run: cargo test --release
+
+      # Exchange this workflow's OIDC identity for a short-lived crates.io
+      # token. No secret is stored; the token is scoped to this crate and
+      # expires shortly after the job.
+      - name: Authenticate to crates.io (Trusted Publishing)
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: Publish
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
