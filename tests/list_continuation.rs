@@ -44,6 +44,20 @@ fn unordered_two_space_continuation() {
 }
 
 #[test]
+fn single_line_item_trailing_whitespace_is_trimmed() {
+    // On a single-line item kramdown trims trailing whitespace — even 2+
+    // spaces make no `<br />` (nothing follows to break to). A multi-line
+    // item where the break would land still declines (see
+    // `declines_irregular_indentation`).
+    ok("* a \n* b\n", "<ul>\n  <li>a</li>\n  <li>b</li>\n</ul>\n");
+    ok("* a  \n* b\n", "<ul>\n  <li>a</li>\n  <li>b</li>\n</ul>\n");
+    ok(
+        "1. one  \n2. two\t\n",
+        "<ol>\n  <li>one</li>\n  <li>two</li>\n</ol>\n",
+    );
+}
+
+#[test]
 fn unordered_lazy_column0_continuation() {
     ok(
         "- first\nsecond\n",

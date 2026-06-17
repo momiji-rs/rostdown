@@ -1733,7 +1733,16 @@ fn parse_list_items<'a>(
                 tight_adjacent = true;
             }
             via_blank = false;
-            let content = strip_marker(l, ordered);
+            let mut content = strip_marker(l, ordered);
+            // Is this item exactly one line? Its next line must end the item —
+            // blank, end-of-input, or a same-kind sibling marker. Anything else
+            // (a lazy/indented continuation) makes it a multi-line item, where
+            // several behaviours below (a `|`-table, trailing-ws hard breaks)
+            // become context-dependent and stay out of subset.
+            let single_line = match lines.get(*i + 1) {
+                None => true,
+                Some(nl) => is_blank(nl) || list_marker(nl) == Some(ordered),
+            };
             // Item content is block-level in kramdown — EOB markers, IALs etc.
             // inside an item are out of subset, same as at the top level. A
             // `|` makes kramdown render a `<table>` inside the `<li>`: support
@@ -1742,15 +1751,8 @@ fn parse_list_items<'a>(
             // out of subset (decline).
             if has_table_pipe(trim_start_ws(content)) {
                 // kramdown makes a `<table>` inside the `<li>` only when EVERY
-                // line of the item's content is a pipe-row. We support the
-                // single-line item: the next line must end this item — blank,
-                // end-of-input, or a same-kind sibling marker. Anything else
-                // (a lazy/indented continuation, with or without its own pipe)
-                // is a multi-line item, out of subset → decline.
-                let single_line = match lines.get(*i + 1) {
-                    None => true,
-                    Some(nl) => is_blank(nl) || list_marker(nl) == Some(ordered),
-                };
+                // line of the item's content is a pipe-row — i.e. a single-line
+                // item here.
                 if !single_line {
                     return Err(declined("table"));
                 }
@@ -1776,9 +1778,16 @@ fn parse_list_items<'a>(
                 continue;
             }
             decline_block_scan(content)?;
-            // Trailing whitespace carries hard-break semantics.
+            // Trailing whitespace on an item line: on a single-line item it is
+            // simply stripped (kramdown trims the last line — even 2+ spaces
+            // make no `<br />` with nothing to break to). On a multi-line item
+            // the trailing run carries hard-break semantics across the join,
+            // which we don't model — decline.
             if trim_end_ws(content) != content {
-                return Err(declined("list-trailing-ws"));
+                if !single_line {
+                    return Err(declined("list-trailing-ws"));
+                }
+                content = trim_end_ws(content);
             }
             // Flush the previous item's span tail back into its node
             // before opening the next item.
