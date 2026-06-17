@@ -299,7 +299,7 @@ pub(crate) fn parse<'a>(src: &'a str, opts: &Options) -> Result<(Ast<'a>, Option
     // Pre-pass: lift block-level link reference definitions out of the
     // stream so the surrounding blank lines collapse the way kramdown's
     // do, and so `[text][id]` / `[text]` resolve during span parsing.
-    let (defs, def_mask) = collect_link_defs(lines);
+    let (defs, def_mask) = collect_link_defs(lines)?;
     let root = if defs.is_empty() {
         parse_blocks(&mut ast, src, lines, opts)?
     } else {
@@ -2377,12 +2377,36 @@ fn parse_link_def(line: &str) -> Option<(String, &str, Option<&str>)> {
     Some((id, url, title))
 }
 
+/// Whether `line` has the block link-definition SHAPE `[id]:` (≤3-space
+/// indent, non-empty bracket id, then a colon) — regardless of whether the
+/// destination/title parse cleanly. Used to decline a definition kramdown
+/// would accept but [`parse_link_def`] can't reproduce (e.g. a destination
+/// with embedded spaces from an unexpanded Liquid `{{ … }}`).
+fn looks_like_link_def(line: &str) -> bool {
+    let lead = line.len() - line.trim_start_matches(' ').len();
+    if lead > 3 {
+        return false;
+    }
+    let Some(t) = line[lead..].strip_prefix('[') else {
+        return false;
+    };
+    let Some(close) = t.find(']') else {
+        return false;
+    };
+    !t[..close].trim_matches([' ', '\t']).is_empty() && t[close + 1..].starts_with(':')
+}
+
 /// Pre-pass: collect block-level link reference definitions and mark each
 /// definition's line for removal from the block stream. A definition is
 /// recognized only at a block boundary (document start, after a blank, or
 /// after another definition); a `[id]: url`-looking line in the middle of
 /// a paragraph stays literal text.
-fn collect_link_defs<'a>(lines: &[&'a str]) -> (LinkDefs<'a>, Vec<bool>) {
+///
+/// A boundary line that has the definition SHAPE but doesn't parse declines
+/// the document: kramdown would still lift it as a definition (so the
+/// surrounding blanks collapse and any `[text][id]` resolves), and emitting
+/// it as a literal paragraph instead would be byte-wrong.
+fn collect_link_defs<'a>(lines: &[&'a str]) -> Result<(LinkDefs<'a>, Vec<bool>), Error> {
     let mut map: LinkDefs<'a> = HashMap::new();
     let mut mask = vec![false; lines.len()];
     let mut at_boundary = true;
@@ -2391,16 +2415,19 @@ fn collect_link_defs<'a>(lines: &[&'a str]) -> (LinkDefs<'a>, Vec<bool>) {
             at_boundary = true;
             continue;
         }
-        if at_boundary
-            && let Some((id, url, title)) = parse_link_def(line)
-        {
-            map.entry(id).or_insert((url, title)); // first definition wins
-            mask[idx] = true;
-            continue; // stay at a boundary: consecutive defs all count
+        if at_boundary {
+            if let Some((id, url, title)) = parse_link_def(line) {
+                map.entry(id).or_insert((url, title)); // first definition wins
+                mask[idx] = true;
+                continue; // stay at a boundary: consecutive defs all count
+            }
+            if looks_like_link_def(line) {
+                return Err(declined("link-definition"));
+            }
         }
         at_boundary = false;
     }
-    (map, mask)
+    Ok((map, mask))
 }
 
 /// Parse `![alt](src "title")` at the start of `rest` (`rest` begins with
@@ -2690,6 +2717,24 @@ mod byte_opt_tests {
         // declined here; a def-shaped line that reaches the block scan is
         // mid-paragraph and stays literal text.
         assert_eq!(reason("[id]: http://x"), None);
+    }
+
+    #[test]
+    fn link_def_shape_detection() {
+        // Parseable definitions and clean shapes.
+        assert!(looks_like_link_def("[id]: http://x"));
+        assert!(looks_like_link_def("   [id]: http://x")); // ≤3-space indent
+        // The real-world blocker: an unexpanded Liquid `{{ … }}` puts a
+        // space in the destination, so `parse_link_def` fails — but the
+        // SHAPE matches, so the document declines instead of emitting the
+        // line as a literal paragraph.
+        assert!(looks_like_link_def("[1349]: {{ site.repository }}/issues/1349"));
+        assert_eq!(parse_link_def("[1349]: {{ site.repository }}/issues/1349"), None);
+        // Not definitions: inline link, mid-line, empty id, deep indent.
+        assert!(!looks_like_link_def("[text](url)"));
+        assert!(!looks_like_link_def("see [id]: later"));
+        assert!(!looks_like_link_def("[]: http://x"));
+        assert!(!looks_like_link_def("    [id]: http://x")); // 4 spaces = code
     }
 
     #[test]
