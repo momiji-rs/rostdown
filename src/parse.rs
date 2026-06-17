@@ -37,6 +37,10 @@ use crate::{Error, Options, typography};
 /// the url/title borrowing from `src`.
 type LinkDefs<'a> = HashMap<String, (&'a str, Option<&'a str>)>;
 
+/// Span IAL attributes (`[t](u){:.c}`) keyed by span index — a side table
+/// so the hot per-span `SpanNode` stays small. Empty for most docs.
+type SpanIals<'a> = HashMap<u32, Vec<(Cow<'a, str>, String)>>;
+
 #[derive(Debug, Default)]
 pub(crate) struct Ast<'a> {
     pub(crate) blocks: Vec<BlockNode<'a>>,
@@ -45,6 +49,8 @@ pub(crate) struct Ast<'a> {
     /// `[id]: url "title"` definitions, collected in a pre-pass and keyed
     /// by normalized id. Empty for the common doc with none.
     pub(crate) link_defs: LinkDefs<'a>,
+    /// Span IAL attributes keyed by span index (see [`SpanIals`]).
+    pub(crate) span_ials: SpanIals<'a>,
 }
 
 impl<'a> Ast<'a> {
@@ -65,6 +71,7 @@ impl<'a> Ast<'a> {
             spans: Vec::with_capacity(src_len / 12 + 16),
             items: Vec::with_capacity(src_len / 256 + 4),
             link_defs: HashMap::new(),
+            span_ials: HashMap::new(),
         }
     }
 
@@ -2042,7 +2049,26 @@ fn parse_spans_until<'a>(
                 return Err(declined("strikethrough"));
             }
             b'{' if bytes.get(i + 1) == Some(&b':') => {
-                // Span IALs `{: …}` and extensions `{::comment}` etc.
+                // Span IAL: `{:…}` immediately after a span element (no text
+                // between) attaches its attributes to it. `{::` extensions,
+                // non-adjacent forms, and IALs on code/text decline.
+                if bytes.get(i + 2) != Some(&b':')
+                    && acc.is_empty()
+                    && let Some(last) = chain.last
+                    && matches!(
+                        ast.spans[last as usize].kind,
+                        SpanKind::Link { .. }
+                            | SpanKind::Image { .. }
+                            | SpanKind::Em(_)
+                            | SpanKind::Strong(_)
+                    )
+                    && let Some(close_rel) = text[i + 2..].find('}')
+                    && let Some(attrs) = parse_ial(&text[i + 2..i + 2 + close_rel])
+                {
+                    ast.span_ials.insert(last, attrs);
+                    i += 2 + close_rel + 1;
+                    continue;
+                }
                 return Err(declined("ial-or-extension"));
             }
             b'\'' | b'"' => {

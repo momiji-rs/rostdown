@@ -209,6 +209,15 @@ fn convert_blocks(
     }
 }
 
+/// Emit a span element's IAL attributes (`[t](u){:.c}`), if any, from the
+/// side table — used inside the open tag, after the element's own attrs.
+#[inline]
+fn emit_span_ial(out: &mut String, ast: &Ast<'_>, idx: u32) {
+    if let Some(attrs) = ast.span_ials.get(&idx) {
+        emit_attrs(out, attrs);
+    }
+}
+
 /// Emit an IAL's attributes into an open tag: ` key="value"` per pair in
 /// insertion order, the value HTML-attr-escaped.
 fn emit_attrs(out: &mut String, attrs: &[(Cow<'_, str>, String)]) {
@@ -328,12 +337,16 @@ fn convert_spans(out: &mut String, ast: &Ast<'_>, head: Option<u32>, codespan_cl
         match &span.kind {
             SpanKind::Text(t) => escape_text(out, t),
             SpanKind::Em(inner) => {
-                out.push_str("<em>");
+                out.push_str("<em");
+                emit_span_ial(out, ast, idx);
+                out.push('>');
                 convert_spans(out, ast, *inner, codespan_class);
                 out.push_str("</em>");
             }
             SpanKind::Strong(inner) => {
-                out.push_str("<strong>");
+                out.push_str("<strong");
+                emit_span_ial(out, ast, idx);
+                out.push('>');
                 convert_spans(out, ast, *inner, codespan_class);
                 out.push_str("</strong>");
             }
@@ -358,6 +371,7 @@ fn convert_spans(out: &mut String, ast: &Ast<'_>, head: Option<u32>, codespan_cl
                     escape_attr(out, title);
                     out.push('"');
                 }
+                emit_span_ial(out, ast, idx);
                 out.push('>');
                 convert_spans(out, ast, *spans, codespan_class);
                 out.push_str("</a>");
@@ -373,6 +387,7 @@ fn convert_spans(out: &mut String, ast: &Ast<'_>, head: Option<u32>, codespan_cl
                     escape_attr(out, title);
                     out.push('"');
                 }
+                emit_span_ial(out, ast, idx);
                 out.push_str(" />");
             }
         }
