@@ -77,28 +77,43 @@ fn is_block_start(name: &str) -> bool {
     !is_decline_raw(name) && !is_inline(name)
 }
 
-/// Whether `line` (already known to be at a block boundary) begins a
-/// supported HTML block: column 0, `<name` with `name` a block-start
-/// element. Used by the paragraph scanner to break before an HTML block and
-/// by the block loop to dispatch into [`serialize`].
-pub(crate) fn starts_html_block(line: &str) -> bool {
+/// If `line` begins with a tag-name token `<name` (terminated by whitespace,
+/// `>`, or `/`), return the lowercased `name`; else `None`.
+fn leading_tag_name(line: &str) -> Option<String> {
     let b = line.as_bytes();
     if b.first() != Some(&b'<') {
-        return false;
+        return None;
     }
     let mut j = 1;
     while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-') {
         j += 1;
     }
     if j == 1 {
-        return false;
+        return None;
     }
-    // Name must be followed by whitespace, `>`, or `/` (end of the tag name).
     if !matches!(b.get(j), None | Some(b' ') | Some(b'\t') | Some(b'>') | Some(b'/')) {
-        return false;
+        return None;
     }
-    let name = line[1..j].to_ascii_lowercase();
-    is_block_start(&name)
+    Some(line[1..j].to_ascii_lowercase())
+}
+
+/// Whether `line` (already known to be at a block boundary) begins a
+/// supported HTML block: column 0, `<name` with `name` a block-start
+/// element. Used by the paragraph scanner to break before an HTML block and
+/// by the block loop to dispatch into [`serialize`].
+pub(crate) fn starts_html_block(line: &str) -> bool {
+    leading_tag_name(line).is_some_and(|n| is_block_start(&n))
+}
+
+/// Whether `line` begins with a NON-VOID span-level HTML element — `<em>`,
+/// `<a>`, `<code>`, `<small>`, `<sub>`, … kramdown does NOT open an HTML block
+/// on these: the line starts an ordinary paragraph whose span parser
+/// re-serializes the inline element (markdown parsed inside), so the block
+/// scanner must NOT decline it as a raw HTML block. Void elements are
+/// excluded: some (`<hr>`) are block-level in kramdown (a bare `<hr>` is an
+/// HR block, not a `<p>`-wrapped span), so declining them stays safe.
+pub(crate) fn starts_span_element(line: &str) -> bool {
+    leading_tag_name(line).is_some_and(|n| is_inline(&n) && !is_void(&n))
 }
 
 struct Parser<'a> {

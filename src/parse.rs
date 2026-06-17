@@ -1584,12 +1584,16 @@ fn decline_block_scan(line: &str) -> Result<(), Error> {
     // Block-level link reference definitions are lifted out in a pre-pass
     // (see collect_link_defs); a `[id]: url`-looking line that reaches here
     // is mid-paragraph and stays literal text, exactly as in kramdown.
-    // Raw HTML blocks (a line opening with a tag).
+    // Raw HTML blocks (a line opening with a tag). A line that opens with a
+    // SPAN-level element (`<em>`, `<a>`, `<code>`, …) is NOT an HTML block in
+    // kramdown — it starts a paragraph whose span parser re-serializes the
+    // element — so let it fall through to the paragraph path.
     let bytes = t.as_bytes();
     if bytes.first() == Some(&b'<')
         && bytes
             .get(1)
             .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'/' || *c == b'!' || *c == b'?')
+        && !crate::html_block::starts_span_element(t)
     {
         return Err(declined("html-block"));
     }

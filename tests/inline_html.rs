@@ -116,6 +116,31 @@ fn autolinks() {
 }
 
 #[test]
+fn span_element_at_block_start_is_a_paragraph() {
+    // A line opening with a NON-VOID span element is not an HTML block —
+    // kramdown starts a paragraph and re-serializes the inline element,
+    // parsing markdown inside it.
+    ok(
+        "<small>by A, B, C</small>\n",
+        "<p><small>by A, B, C</small></p>\n",
+    );
+    ok(
+        "<code>:a</code>, <code>:b</code> and more\n",
+        "<p><code>:a</code>, <code>:b</code> and more</p>\n",
+    );
+    ok(
+        "<a href=\"/x\">**link**</a> then text\n",
+        "<p><a href=\"/x\"><strong>link</strong></a> then text</p>\n",
+    );
+    // A bare void block opener (`<hr>`/`<br>`) is NOT a span paragraph in
+    // kramdown (`<hr>` is a block element), so we decline rather than wrap it.
+    declined("<hr>\ntext\n");
+    declined("<br>\ntext\n");
+    // An unclosed span at block start auto-closes in kramdown; out of subset.
+    declined("<em>unclosed\nmore\n");
+}
+
+#[test]
 fn inline_html_out_of_subset_declines() {
     // Comment / close-without-open.
     declined("a <!-- c --> b\n");
