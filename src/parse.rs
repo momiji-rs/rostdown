@@ -1537,9 +1537,17 @@ fn parse_list_items<'a>(
                     if trim_end_ws(cont) != cont || cont.starts_with(' ') || cont.starts_with('\t') {
                         return Err(declined("list-continuation-ws"));
                     }
+                    let parsed = parse_spans(ast, cont)?;
+                    // A bare emphasis/code marker on either side of the join
+                    // would pair across the line break under kramdown; our
+                    // per-line parse leaves both literal, so decline.
+                    if chain_has_bare_marker(ast, parsed)
+                        || chain_has_bare_marker(ast, cur_spans.first())
+                    {
+                        return Err(declined("list-continuation-inline-span"));
+                    }
                     let nl = ast.push_span(SpanKind::Text(Cow::Borrowed("\n")));
                     cur_spans.link(nl, |p, n| ast.spans[p as usize].next = Some(n));
-                    let parsed = parse_spans(ast, cont)?;
                     chain_extend_spans(ast, &mut cur_spans, parsed);
                     j += 1;
                 }
@@ -1604,9 +1612,16 @@ fn parse_list_items<'a>(
                         // our emit shape.
                         return Err(declined("list-after-child"));
                     }
+                    let parsed = parse_spans(ast, l)?;
+                    // See the tail-continuation arm: a bare emphasis/code
+                    // marker that would pair across the line break declines.
+                    if chain_has_bare_marker(ast, parsed)
+                        || chain_has_bare_marker(ast, cur_spans.first())
+                    {
+                        return Err(declined("list-continuation-inline-span"));
+                    }
                     let nl = ast.push_span(SpanKind::Text(Cow::Borrowed("\n")));
                     cur_spans.link(nl, |p, n| ast.spans[p as usize].next = Some(n));
-                    let parsed = parse_spans(ast, l)?;
                     chain_extend_spans(ast, &mut cur_spans, parsed);
                     ast.items[item as usize].spans = cur_spans.first();
                     *i += 1;
@@ -1640,6 +1655,27 @@ fn chain_extend_spans(ast: &mut Ast<'_>, chain: &mut Chain, head: Option<u32>) {
         tail = n;
     }
     chain.last = Some(tail);
+}
+
+/// Whether the top-level span chain `head` carries a bare emphasis/code
+/// delimiter (`*` or backtick) in a Text node — a marker the per-line parse
+/// couldn't pair within its own physical line. In a multi-line list item
+/// such a marker may pair with one on another line under kramdown's
+/// join-then-parse, which our zero-copy per-line parse can't reproduce
+/// (the joined text would need an owned buffer outliving the borrow), so
+/// the item declines. `_` is deliberately excluded: intra-word underscores
+/// (`runtime_deps`) are literal in both engines and would over-decline.
+fn chain_has_bare_marker(ast: &Ast<'_>, head: Option<u32>) -> bool {
+    let mut cur = head;
+    while let Some(idx) = cur {
+        if let SpanKind::Text(t) = &ast.spans[idx as usize].kind
+            && t.bytes().any(|b| b == b'*' || b == b'`')
+        {
+            return true;
+        }
+        cur = ast.spans[idx as usize].next;
+    }
+    false
 }
 
 fn list_marker(line: &str) -> Option<bool> {

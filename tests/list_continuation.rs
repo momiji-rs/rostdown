@@ -129,6 +129,19 @@ fn declines_mixed_and_multiblock_lists() {
 }
 
 #[test]
+fn declines_emphasis_spanning_a_continuation() {
+    // kramdown joins an item's lines, then parses inline — so `*` opening on
+    // one physical line pairs with `*` on the next. Our zero-copy parse runs
+    // per line and would leave both literal, so we decline. (Balanced inline
+    // markup within a single continuation line is still fine — see
+    // `continuation_keeps_inline_markup`.)
+    declined("- a *open\n  close* b\n");
+    declined("- a **strong\n  across** b\n");
+    // Bare marker on the marker line, closer on the continuation.
+    declined("- start *here\n  there*\n");
+}
+
+#[test]
 fn declines_irregular_indentation() {
     // 1-space indent (kramdown reads it as a same-level item).
     declined("- a\n b\n");
