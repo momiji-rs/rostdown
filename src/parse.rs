@@ -2256,8 +2256,13 @@ fn parse_spans_until<'a>(
             b'[' => {
                 acc.flush(ast, &mut chain);
                 let rest = &text[i..];
-                if let Some((spans, href, title, len)) =
-                    parse_link(ast, rest, in_em, in_strong)?
+                // kramdown forbids nested links: inside a link's text a
+                // `[…](…)` stays literal (an image `![…](…)` is still fine,
+                // handled by the `!` arm). So only attempt a link when not
+                // already inside one.
+                if parent != Some(Elem::Link)
+                    && let Some((spans, href, title, len)) =
+                        parse_link(ast, rest, in_em, in_strong)?
                 {
                     let idx = ast.push_span(SpanKind::Link { spans, href, title });
                     chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
@@ -2408,6 +2413,17 @@ fn parse_spans_until<'a>(
             b'\'' | b'"' => {
                 if run_len(bytes, i, c) > 1 {
                     return Err(declined("quote-run"));
+                }
+                // A smart quote immediately after a code span sits on a
+                // boundary kramdown classifies with its intricate SQ_RULES
+                // (e.g. `` `x`'d `` opens but `` `x`'s `` closes) — we can't
+                // reproduce that reliably, so decline.
+                if acc.is_empty()
+                    && chain
+                        .last
+                        .is_some_and(|l| matches!(ast.spans[l as usize].kind, SpanKind::Code(_)))
+                {
+                    return Err(declined("quote-after-code"));
                 }
                 let q = typography::smart_quote(prev, c == b'\'', &text[i + 1..])?;
                 // Smart quote: the emitted char (U+2018..U+201D) always
@@ -2984,15 +3000,48 @@ fn parse_link<'a>(
     // links rendered literally); rather than risk wrong output we decline
     // so the document falls back — the same right-or-declined result these
     // produced before inline-link text was widened.
+    // Find the `]` that closes the link text, tracking bracket depth so
+    // balanced nested brackets (`[text [x] y]`, a linked image `[![…](…)]`)
+    // stay inside the text, skipping code spans (a `[` in `` `…` `` is
+    // literal) and escaped chars (`\]`). `parse_spans_until` then renders the
+    // text — including any nested image, code span, or literal brackets.
     let mut close = None;
+    let mut depth = 0u32;
     let mut k = 1;
     while k < bytes.len() {
         match bytes[k] {
-            b'\\' => return Err(declined("link-text-escape")),
-            b'[' => return Err(declined("link-text-nested")),
+            b'\\' => {
+                k += 2; // skip the escaped char
+                continue;
+            }
+            b'`' => {
+                // Skip a balanced code span (matching backtick-run lengths).
+                let run = run_len(bytes, k, b'`');
+                let mut j = k + run;
+                let mut closed = false;
+                while j < bytes.len() {
+                    if bytes[j] == b'`' {
+                        let r2 = run_len(bytes, j, b'`');
+                        if r2 == run {
+                            j += run;
+                            closed = true;
+                            break;
+                        }
+                        j += r2;
+                    } else {
+                        j += 1;
+                    }
+                }
+                k = if closed { j } else { k + run };
+                continue;
+            }
+            b'[' => depth += 1,
             b']' => {
-                close = Some(k);
-                break;
+                if depth == 0 {
+                    close = Some(k);
+                    break;
+                }
+                depth -= 1;
             }
             _ => {}
         }
@@ -3017,9 +3066,9 @@ fn parse_link<'a>(
         return Ok(None);
     };
     // Balanced parens in a URL (`…/Foo_(bar)`) and angle-bracket
-    // destinations (`<with spaces>`) are out of subset — the cheap
-    // first-`)` scan can't reproduce them, so decline rather than emit a
-    // truncated href.
+    // destinations (`<with spaces>`) need kramdown's quirkier dest scan
+    // (it even keeps an unbalanced `(` with a following title) — the cheap
+    // first-`)` scan can't reproduce them, so decline rather than truncate.
     if href.contains('(') || href.starts_with('<') {
         return Err(declined("link-dest"));
     }
