@@ -54,6 +54,9 @@ fn typography() {
         "<p>It\u{2019}s \u{201C}quoted\u{201D} \u{2013} and\u{2026} done</p>\n"
     );
     assert_eq!(render("em --- dash\n"), "<p>em \u{2014} dash</p>\n");
+    // HTML entities resolve to characters (`:as_char`); the named `&amp;`
+    // round-trips back to escaped on output.
+    assert_eq!(render("&copy; 2024 &amp; on\n"), "<p>© 2024 &amp; on</p>\n");
 }
 
 /// Heading ids — kramdown-parser-gfm's `generate_gfm_header_id`, NOT
@@ -94,7 +97,7 @@ fn declines() {
         "para\n====\n",              // setext heading
         "text with line  \nbreak\n", // hard break
         "{:toc}\n",                  // IAL / extension
-        "&copy; entity\n",           // entity reference
+        "&#38; numeric amp\n",       // numeric ref to `&` (source form unreproducible)
     ] {
         assert!(
             to_html(src, &Options::jekyll(), &mut NoHighlight).is_err(),

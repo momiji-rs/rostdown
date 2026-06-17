@@ -15,6 +15,7 @@
 mod html;
 #[cfg(feature = "arena")]
 mod arena;
+mod entities;
 mod parse;
 mod scan;
 mod typography;

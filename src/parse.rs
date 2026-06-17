@@ -2129,22 +2129,38 @@ fn parse_spans_until<'a>(
                 return Err(declined("guillemets"));
             }
             b'&' => {
-                // Entity references are parsed by kramdown; bare `&` is
-                // escaped. Treat `&word;` / `&#…;` as out of subset.
-                let rest = &text[i + 1..];
-                let semi = rest.find(';');
-                if let Some(s) = semi
-                    && s <= 8
-                    && rest[..s]
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '#')
-                    && s > 0
-                {
-                    return Err(declined("entity"));
+                // Resolve an HTML entity to its character (kramdown's
+                // `:as_char` output). A reference that isn't a known
+                // entity — unknown name, malformed numeric, no `;` — leaves
+                // the `&` literal, and `escape_text` then emits `&amp;…`,
+                // exactly as kramdown does for an unrecognized entity.
+                if let Some((cp, len)) = parse_entity(&text[i..]) {
+                    // `&`, `<`, `>` stay escaped, and kramdown preserves the
+                    // SOURCE form: a NAMED `&amp;` re-emits `&amp;` (which a
+                    // pushed `&` + escape_text reproduces exactly), but a
+                    // NUMERIC `&#38;` re-emits `&#38;`, which escaping a `&`
+                    // can't — so decline the numeric form of those three.
+                    if matches!(cp, 0x26 | 0x3C | 0x3E) && bytes[i + 1] == b'#' {
+                        return Err(declined("numeric-special-entity"));
+                    }
+                    match char::from_u32(cp) {
+                        // The decoded char is pushed as a rewrite — it is NOT
+                        // re-scanned, so `&#42;` stays a literal `*`, never
+                        // emphasis, matching kramdown.
+                        Some(ch) => {
+                            acc.push_char(ch, i, i + len);
+                            prev = Some(ch);
+                            i += len;
+                        }
+                        // Out-of-range / surrogate code point: kramdown emits
+                        // U+FFFD replacements we don't reproduce — decline.
+                        None => return Err(declined("invalid-entity-codepoint")),
+                    }
+                } else {
+                    acc.push_byte(i); // literal `&`, verbatim
+                    prev = Some('&');
+                    i += 1;
                 }
-                acc.push_byte(i); // literal `&`, verbatim
-                prev = Some('&');
-                i += 1;
             }
             b'~' if bytes.get(i + 1) == Some(&b'~') => {
                 return Err(declined("strikethrough"));
@@ -2429,6 +2445,61 @@ fn normalize_ref_id(s: &str) -> String {
 /// Parse a link reference definition: `[id]: url`, with `url` bare or in
 /// `<…>`, an optional `"title"` / `'title'` / `(title)`, behind ≤3 spaces.
 /// `None` unless the whole line is a clean single-line definition.
+/// Parse an HTML entity at the start of `s` (`s` begins with `&`), returning
+/// its resolved code point and the byte length consumed (through the `;`).
+/// `None` ⇒ not a recognized entity, so the caller leaves the `&` literal.
+/// A well-formed numeric reference that overflows / is out of range still
+/// returns `Some` with an invalid code point so the caller declines (rather
+/// than mis-emitting a literal `&`, which kramdown would not).
+fn parse_entity(s: &str) -> Option<(u32, usize)> {
+    let b = s.as_bytes();
+    debug_assert_eq!(b.first(), Some(&b'&'));
+    if b.get(1) == Some(&b'#') {
+        let (radix, start) = match b.get(2) {
+            Some(&b'x') | Some(&b'X') => (16u32, 3),
+            _ => (10u32, 2),
+        };
+        let mut j = start;
+        let mut val: u64 = 0;
+        while let Some(&d) = b.get(j) {
+            if d == b';' {
+                break;
+            }
+            let digit = (d as char).to_digit(radix)?; // non-digit ⇒ literal `&`
+            val = val.saturating_mul(radix as u64).saturating_add(digit as u64);
+            j += 1;
+        }
+        // Need at least one digit and a closing `;`.
+        if j == start || b.get(j) != Some(&b';') {
+            return None;
+        }
+        // Apply the C1 numeric remap; out-of-range stays out of range so the
+        // caller's `char::from_u32` rejects it and the document declines.
+        let cp = if val <= 0x10_FFFF {
+            crate::entities::remap_numeric(val as u32)
+        } else {
+            0x11_0000
+        };
+        Some((cp, j + 1))
+    } else {
+        let mut j = 1;
+        while let Some(&d) = b.get(j) {
+            if d == b';' {
+                break;
+            }
+            if !d.is_ascii_alphanumeric() {
+                return None; // names are alphanumeric in kramdown's table
+            }
+            j += 1;
+        }
+        if j == 1 || b.get(j) != Some(&b';') {
+            return None;
+        }
+        let cp = crate::entities::named(&s[1..j])?;
+        Some((cp, j + 1))
+    }
+}
+
 fn parse_link_def(line: &str) -> Option<(String, &str, Option<&str>)> {
     let lead = line.len() - line.trim_start_matches(' ').len();
     if lead > 3 {
