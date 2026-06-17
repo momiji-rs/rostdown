@@ -93,7 +93,10 @@ fn convert_blocks(
                 push_pad(out, indent);
                 out.push_str("<h");
                 push_level_digit(out, *level);
-                if opts.auto_ids {
+                emit_attrs(out, &block.ial);
+                // auto_ids supplies an id only when an IAL didn't set one.
+                let ial_has_id = block.ial.iter().any(|(k, _)| k.as_ref() == "id");
+                if opts.auto_ids && !ial_has_id {
                     // GFM sets ids at parse time with its own slug
                     // algorithm; core uses the converter's. Parse
                     // validated gfm_slug, so the fallback is inert.
@@ -126,7 +129,7 @@ fn convert_blocks(
                 loose,
                 items,
             } => {
-                emit_list(out, ast, *items, *ordered, *loose, indent, hl);
+                emit_list(out, ast, *items, *ordered, *loose, &block.ial, indent, hl);
             }
             BlockKind::Quote(inner) => {
                 push_pad(out, indent);
@@ -279,12 +282,14 @@ fn emit_table_row(
 ///   {pad+4}<li>b</li>
 ///   {pad+2}</ul>
 ///   {pad}</li>
+#[allow(clippy::too_many_arguments)]
 fn emit_list(
     out: &mut String,
     ast: &Ast<'_>,
     items: Option<u32>,
     ordered: bool,
     loose: bool,
+    ial: &[(Cow<'_, str>, String)],
     indent: usize,
     hl: &mut dyn CodeHighlighter,
 ) {
@@ -292,6 +297,7 @@ fn emit_list(
     push_pad(out, indent);
     out.push('<');
     out.push_str(tag);
+    emit_attrs(out, ial);
     out.push_str(">\n");
     let mut cur = items;
     while let Some(idx) = cur {
@@ -316,7 +322,7 @@ fn emit_list(
         match &item.child {
             Some((c_ord, c_items)) => {
                 out.push('\n');
-                emit_list(out, ast, *c_items, *c_ord, false, indent + 4, hl);
+                emit_list(out, ast, *c_items, *c_ord, false, &[], indent + 4, hl);
                 push_pad(out, indent + 2);
                 out.push_str("</li>\n");
             }

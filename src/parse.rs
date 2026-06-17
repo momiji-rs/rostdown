@@ -513,10 +513,11 @@ fn parse_blocks<'a>(
             continue;
         }
 
-        // A block IAL line (`{:.class}` …) immediately after a paragraph
-        // attaches its attributes to that paragraph. Span IALs, ALDs,
-        // `{::}` extensions, `{:toc}`, IALs after a blank or after other
-        // block types are out of subset and fall through to decline.
+        // A block IAL line (`{:.class}` …) immediately after a paragraph,
+        // heading, or list attaches its attributes to that block. Span
+        // IALs, ALDs, `{::}` extensions, `{:toc}`, IALs after a blank or
+        // after other block types are out of subset and fall through to
+        // decline.
         if line.trim_start_matches([' ', '\t']).starts_with("{:")
             && !line.trim_start_matches([' ', '\t']).starts_with("{::")
             && line.len() - line.trim_start_matches(' ').len() <= 3
@@ -524,7 +525,10 @@ fn parse_blocks<'a>(
             let t = line.trim_matches([' ', '\t']);
             if let Some(inner) = t.strip_prefix("{:").and_then(|s| s.strip_suffix('}'))
                 && let Some(last) = chain.last
-                && matches!(ast.blocks[last as usize].kind, BlockKind::Para(_))
+                && matches!(
+                    ast.blocks[last as usize].kind,
+                    BlockKind::Para(_) | BlockKind::Heading { .. } | BlockKind::List { .. }
+                )
                 && ast.blocks[last as usize].ial.is_empty()
                 && let Some(attrs) = parse_ial(inner)
             {
@@ -1552,6 +1556,12 @@ fn parse_list_items<'a>(
             return Err(declined("list-continuation"));
         } else if list_marker(l).is_some() {
             return Err(declined("mixed-list-markers"));
+        } else if l.starts_with("{:") && !l.starts_with("{::") {
+            // A block-IAL line abutting the list terminates it; the main
+            // loop then attaches the IAL to the emitted list block. (We
+            // only reach here at column 0 — indented `{:` was caught by the
+            // leading-space arm above.)
+            break;
         } else {
             // Lazy continuation line appended to the last item.
             decline_block_scan(l)?;
