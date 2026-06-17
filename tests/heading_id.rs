@@ -74,14 +74,27 @@ fn unclassified_letters_still_decline() {
 }
 
 #[test]
-fn trailing_header_ial_declines() {
-    // kramdown's header-id / header-IAL shorthand: a trailing `{#id}` or
-    // `{:…}` is stripped and applied as the heading's id/attributes. We
-    // don't model it, so decline rather than slug a wrong id.
-    declined("### With rbenv {#rbenv}\n");
-    declined("## Title {:.note}\n");
-    // But braces NOT in trailing-attribute position stay literal text and
-    // render identically — these must still accept.
+fn trailing_header_id_shorthand() {
+    // kramdown's `… {#id}` shorthand sets the id and is stripped from the
+    // text; the id is NOT slugged and NOT deduplicated.
+    id_is("### With rbenv {#rbenv}\n", "rbenv");
+    ok("### With rbenv {#rbenv}\n", "<h3 id=\"rbenv\">With rbenv</h3>\n");
+    id_is("###  spaced  {#x}\n", "x");
+    // A `{#id}` followed by closing hashes, or glued to a word, or with text
+    // after, is literal — the auto-id slugs the whole text.
+    id_is("### H {#id} ###\n", "h-id");
+    id_is("### a{#id}\n", "aid");
+    id_is("### Mid {#id} text here\n", "mid-id-text-here");
+    // Braces that aren't the id shorthand stay literal text.
     id_is("### Set {x} to value\n", "set-x-to-value");
-    id_is("## Mid {#id} text here\n", "mid-id-text-here");
+    // A trailing `{:.cls}` is NOT an id shorthand; the `{:` span declines.
+    declined("## Title {:.note}\n");
+}
+
+#[track_caller]
+fn ok(src: &str, expected: &str) {
+    match render(src) {
+        Ok(html) => assert_eq!(html, expected, "input: {src:?}"),
+        Err(e) => panic!("declined {src:?}: {e:?}"),
+    }
 }

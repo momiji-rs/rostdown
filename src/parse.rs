@@ -619,24 +619,19 @@ fn parse_blocks<'a>(
                 level += 1;
                 rest = r;
             }
-            if level <= 6
-                && let Some(text) = rest.strip_prefix(' ')
-            {
-                // kramdown strips optional trailing hashes.
+            if level <= 6 && rest.starts_with([' ', '\t']) {
+                // kramdown's ATX header is `#{1,6}[ \t]+(text)`: all leading
+                // whitespace after the hashes is consumed.
+                let text = rest.trim_start_matches([' ', '\t']);
+                // kramdown's header-id shorthand `… {#id}` sets the id and is
+                // stripped (checked on the ws-trimmed text BEFORE stripping
+                // closing `#`s — a `{#id}` followed by `###` is literal).
+                // Otherwise strip optional trailing hashes as usual.
                 let text = trim_end_ws(text);
-                let text = trim_end_ws(text.trim_end_matches('#'));
-                // A trailing `{#id}` / `{:…}` is kramdown's header-id /
-                // header-IAL shorthand: stripped from the text and applied
-                // as the heading's id/attributes. We don't model it, so
-                // decline rather than render the braces literally and slug a
-                // wrong id (e.g. `## With rbenv {#rbenv}` → id="rbenv", not
-                // "with-rbenv-rbenv").
-                if text.ends_with('}')
-                    && let Some(open) = text.rfind('{')
-                    && (text[open..].starts_with("{#") || text[open..].starts_with("{:"))
-                {
-                    return Err(declined("header-ial"));
-                }
+                let (text, explicit_id) = match extract_header_id(text) {
+                    Some((stripped, id)) => (stripped, Some(id)),
+                    None => (trim_end_ws(text.trim_end_matches('#')), None),
+                };
                 let spans = parse_spans(ast, text)?;
                 // span_text is the concatenation of child-span texts.
                 // The overwhelmingly common heading is plain prose — a
@@ -663,8 +658,13 @@ fn parse_blocks<'a>(
                 // classes outside our supported set, empty results)
                 // decline rather than risk a wrong id. The converter
                 // builds the real slug later, so the parser only needs
-                // the validity bit — a non-allocating check.
-                if opts.gfm && opts.auto_ids && !crate::html::gfm_slug_ok(&span_text) {
+                // the validity bit — a non-allocating check. Skipped when an
+                // explicit `{#id}` supplied the id (no auto-id needed).
+                if explicit_id.is_none()
+                    && opts.gfm
+                    && opts.auto_ids
+                    && !crate::html::gfm_slug_ok(&span_text)
+                {
                     return Err(declined("heading-gfm-slug"));
                 }
                 emit_block!(BlockKind::Heading {
@@ -675,6 +675,13 @@ fn parse_blocks<'a>(
                     span_text,
                     spans,
                 });
+                // An explicit `{#id}` becomes the heading's id (after any
+                // leading-IAL classes); kramdown does NOT dedup explicit ids,
+                // and the renderer suppresses the auto-id when an id is set.
+                if let Some(id) = explicit_id {
+                    let hd = chain.last.expect("heading just emitted") as usize;
+                    ast.blocks[hd].ial.push((Cow::Borrowed("id"), id.to_string()));
+                }
                 i += 1;
                 continue;
             }
@@ -1378,6 +1385,34 @@ fn has_table_pipe(t: &str) -> bool {
         }
     }
     false
+}
+
+/// kramdown's ATX header-id shorthand: a trailing ` {#id}` (whitespace
+/// before `{#`, non-empty preceding text, id of `[A-Za-z0-9_-]`) sets the
+/// heading's id and is stripped from the text. Returns `(text_without_id,
+/// id)`. `None` if the text doesn't end in that exact shape — `{:.cls}` is
+/// literal (not an IAL), `word{#id}` (glued) is literal, and a bare
+/// `{#id}` with no preceding text is left for the normal auto-id path
+/// (which already slugs it to `id`).
+fn extract_header_id(text: &str) -> Option<(&str, &str)> {
+    let t = trim_end_ws(text);
+    let inner = t.strip_suffix('}')?;
+    let open = inner.rfind("{#")?;
+    let id = &inner[open + 2..];
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    let before = &inner[..open];
+    let before_trimmed = trim_end_ws(before);
+    // Require separating whitespace before `{#` and non-empty preceding text.
+    if before_trimmed.is_empty() || before.len() == before_trimmed.len() {
+        return None;
+    }
+    Some((before_trimmed, id))
 }
 
 /// Whether `lines[idx]` begins a block that a LEADING IAL (`{:.x}` on the
