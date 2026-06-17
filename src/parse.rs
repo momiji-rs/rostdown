@@ -569,6 +569,15 @@ fn parse_blocks<'a>(
             }
         }
 
+        // A top-level table pipe that `try_parse_table` couldn't render as a
+        // clean table. kramdown still makes a table iff EVERY line of the
+        // block is a row; reproduce that decline. Otherwise the block is a
+        // plain paragraph with literal pipes — fall through to the paragraph
+        // path (NOT a decline), matching kramdown.
+        if has_table_pipe(trim_start_ws(line)) && block_all_pipe(lines, i, opts) {
+            return Err(declined("table"));
+        }
+
         decline_block_scan(line)?;
 
         // ATX heading.
@@ -1339,17 +1348,47 @@ fn has_table_pipe(t: &str) -> bool {
     false
 }
 
+/// Whether EVERY line of the block starting at `start` (until a blank line
+/// or a GFM block boundary) carries a table pipe — kramdown's condition for
+/// turning the whole block into a table. A block with any pipe-less line is
+/// a plain paragraph instead (pipes literal).
+fn block_all_pipe(lines: &[&str], start: usize, opts: &Options) -> bool {
+    let mut e = start;
+    while e < lines.len() {
+        let l = lines[e];
+        if is_blank(l) {
+            break;
+        }
+        if e > start
+            && opts.gfm
+            && (l.starts_with('#')
+                || l.starts_with('>')
+                || list_marker(l).is_some()
+                || l.starts_with("```")
+                || l.starts_with("~~~")
+                || crate::html_block::starts_html_block(l))
+        {
+            break;
+        }
+        if !has_table_pipe(trim_start_ws(l)) {
+            return false;
+        }
+        e += 1;
+    }
+    true
+}
+
 fn decline_block_scan(line: &str) -> Result<(), Error> {
     if line.as_bytes().starts_with(b"    ") || line.as_bytes().first() == Some(&b'\t') {
         return Err(declined("indented-code"));
     }
     let t = trim_start_ws(line);
-    // kramdown starts a table on a line with an unescaped, non-code-span
-    // `|`. A `|` inside a balanced backtick code span (prose mentioning
-    // `arr.each { |x| … }`) is literal, not a table trigger.
-    if has_table_pipe(t) {
-        return Err(declined("table"));
-    }
+    // NOTE: the table-trigger pipe check is NOT here — kramdown only makes a
+    // table when EVERY line of the block is a row, so a lone pipe line is a
+    // paragraph. Callers that need the decline (list-item content, where
+    // kramdown tables a pipe inside the `<li>`) check `has_table_pipe`
+    // explicitly; the block loop routes a non-table pipe block to the
+    // paragraph path instead.
     if t.starts_with("{:") || t.starts_with("{::") {
         return Err(declined("ald-ial-extension"));
     }
@@ -1515,7 +1554,11 @@ fn parse_list_items<'a>(
             let content = strip_marker(l, ordered);
             // Item content is block-level in kramdown — tables,
             // EOB markers, IALs etc. inside an item are out of
-            // subset, same as at the top level.
+            // subset, same as at the top level. A `|` inside an item makes
+            // kramdown render a `<table>` inside the `<li>` (out of subset).
+            if has_table_pipe(trim_start_ws(content)) {
+                return Err(declined("table"));
+            }
             decline_block_scan(content)?;
             // Trailing whitespace carries hard-break semantics.
             if trim_end_ws(content) != content {
@@ -1572,6 +1615,9 @@ fn parse_list_items<'a>(
                 // newline, indentation stripped).
                 while j < tail.len() && list_marker(tail[j]).is_none() {
                     let cont = tail[j];
+                    if has_table_pipe(trim_start_ws(cont)) {
+                        return Err(declined("table"));
+                    }
                     decline_block_scan(cont)?;
                     if trim_end_ws(cont) != cont || cont.starts_with(' ') || cont.starts_with('\t') {
                         return Err(declined("list-continuation-ws"));
@@ -1639,6 +1685,9 @@ fn parse_list_items<'a>(
             break;
         } else {
             // Lazy continuation line appended to the last item.
+            if has_table_pipe(trim_start_ws(l)) {
+                return Err(declined("table"));
+            }
             decline_block_scan(l)?;
             if trim_end_ws(l) != l {
                 return Err(declined("list-continuation-ws"));
@@ -2928,19 +2977,23 @@ mod byte_opt_tests {
     }
 
     #[test]
-    fn decline_table_pipe_escape_and_multibyte() {
-        assert_eq!(reason("plain prose, nothing special"), None);
-        assert_eq!(reason("a | b"), Some("table")); // unescaped pipe
-        assert_eq!(reason(r"a \| b"), None); // escaped pipe is NOT a table
-        assert_eq!(reason(r"a \\| b"), Some("table")); // \\ then | → unescaped
+    fn table_pipe_escape_and_multibyte() {
+        // The table-trigger pipe scan (now consulted by the block loop and
+        // list-item parser, not `decline_block_scan`).
+        assert!(!has_table_pipe("plain prose, nothing special"));
+        assert!(has_table_pipe("a | b")); // unescaped pipe
+        assert!(!has_table_pipe(r"a \| b")); // escaped pipe is NOT a table
+        assert!(has_table_pipe(r"a \\| b")); // \\ then | → unescaped
         // byte scan must stay correct around multibyte chars:
-        assert_eq!(reason("café | x"), Some("table"));
-        assert_eq!(reason(r"café \| x"), None);
-        assert_eq!(reason("naïve prose"), None); // multibyte, no pipe
+        assert!(has_table_pipe("café | x"));
+        assert!(!has_table_pipe(r"café \| x"));
+        assert!(!has_table_pipe("naïve prose")); // multibyte, no pipe
         // A `|` inside a balanced code span is literal, not a table.
-        assert_eq!(reason("prose `arr.each { |x| x }` here"), None);
-        assert_eq!(reason("`|`"), None); // a lone piped code span
-        assert_eq!(reason("`code` | real"), Some("table")); // top-level pipe
+        assert!(!has_table_pipe("prose `arr.each { |x| x }` here"));
+        assert!(!has_table_pipe("`|`")); // a lone piped code span
+        assert!(has_table_pipe("`code` | real")); // top-level pipe
+        // `decline_block_scan` no longer declines a lone pipe line.
+        assert_eq!(reason("a | b"), None);
     }
 
     #[test]
