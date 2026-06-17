@@ -95,7 +95,7 @@ fn declines() {
     for src in [
         "| a | b |\n| c |\n",        // ragged table (column counts differ)
         "para\n====\n",              // setext heading
-        "text with line  \nbreak\n", // hard break
+        "line\twith trailing tab\t\nnext\n", // EOL tab (kramdown corner)
         "{:toc}\n",                  // IAL / extension
         "&#38; numeric amp\n",       // numeric ref to `&` (source form unreproducible)
     ] {

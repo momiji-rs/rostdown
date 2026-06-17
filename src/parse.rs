@@ -1542,13 +1542,15 @@ fn opt_space_opener(line: &str, opts: &Options) -> bool {
 /// break. Called with the just-completed interior line (the one whose
 /// line ending is about to become a `\n` join).
 fn decline_eol(last: &str) -> Result<(), Error> {
+    // 2+ trailing spaces and a SINGLE trailing `\` are hard line breaks, now
+    // rendered as `<br />` by the span parser — no longer declined here.
     let stripped = last.trim_end_matches(' ');
-    if last.len() - stripped.len() >= 2 {
-        return Err(declined("hard-break"));
-    }
-    if stripped.ends_with('\\') {
+    // ≥2 trailing backslashes before the join (an escaped backslash adjacent
+    // to the line-break backslash) is a kramdown corner — decline.
+    if stripped.len() - stripped.trim_end_matches('\\').len() >= 2 {
         return Err(declined("eol-backslash"));
     }
+    // A trailing TAB is kramdown's own edge (not `(  |\\)`); keep declining.
     if stripped.ends_with('\t') {
         return Err(declined("eol-tab"));
     }
@@ -2102,6 +2104,16 @@ fn parse_spans_until<'a>(
         match c {
             b'\\' if i + 1 < bytes.len() => {
                 let next = bytes[i + 1] as char;
+                // A backslash immediately before a newline is a hard line
+                // break (kramdown), like trailing double-space.
+                if next == '\n' {
+                    acc.flush(ast, &mut chain);
+                    let br = ast.push_span(SpanKind::Raw(Cow::Borrowed("<br />")));
+                    chain.link(br, |q, n| ast.spans[q as usize].next = Some(n));
+                    prev = Some('\n');
+                    i += 1; // consume the `\`; the `\n` stays as joined text
+                    continue;
+                }
                 // kramdown's exact ESCAPED_CHARS set; anything else
                 // keeps the backslash literally.
                 if "\\.*_+`<>()[]{}#!:|\"'$=-".contains(next) {
@@ -2459,12 +2471,36 @@ fn parse_spans_until<'a>(
                 // emphasis close.
                 let start = i;
                 // bytes[i] is non-trigger (this arm); find the next one.
-                i = match next_trigger(&bytes[i + 1..]) {
+                let run_end = match next_trigger(&bytes[i + 1..]) {
                     Some(off) => i + 1 + off,
                     None => bytes.len(),
                 };
-                acc.push_verbatim(start, i);
-                prev = text[start..i].chars().next_back();
+                // Hard line break: ≥2 spaces immediately before a `\n`
+                // become a `<br />` (kramdown), consuming exactly two
+                // spaces. Split the run at each such break; the `\n` itself
+                // stays as joined text. (The backslash form `\<nl>` is a
+                // trigger and is handled in the `\\` arm.)
+                let mut seg = start;
+                let mut p = start;
+                while p < run_end {
+                    if bytes[p] == b'\n' {
+                        let mut sp = 0;
+                        while p > start + sp && bytes[p - 1 - sp] == b' ' {
+                            sp += 1;
+                        }
+                        if sp >= 2 {
+                            acc.push_verbatim(seg, p - 2);
+                            acc.flush(ast, &mut chain);
+                            let br = ast.push_span(SpanKind::Raw(Cow::Borrowed("<br />")));
+                            chain.link(br, |q, n| ast.spans[q as usize].next = Some(n));
+                            seg = p; // drop the two spaces; keep the newline
+                        }
+                    }
+                    p += 1;
+                }
+                acc.push_verbatim(seg, run_end);
+                prev = text[seg..run_end].chars().next_back();
+                i = run_end;
             }
         }
     }
