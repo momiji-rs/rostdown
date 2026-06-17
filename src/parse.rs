@@ -2363,8 +2363,20 @@ fn parse_spans_until<'a>(
                 }
             }
             b'<' => {
-                // Autolinks / inline HTML are out of subset; a bare `<`
-                // followed by space/punct is plain text.
+                // Autolink (`<https://x>`, `<a@b.com>`): kramdown's :autolink
+                // span parser runs BEFORE span HTML, so try it first (and not
+                // gated on an alphabetic next byte — an email may start with a
+                // digit).
+                if let Some((html, len)) = crate::html_block::autolink_at(&text[i..]) {
+                    acc.flush(ast, &mut chain);
+                    let idx = ast.push_span(SpanKind::Raw(Cow::Owned(html)));
+                    chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
+                    prev = Some('>');
+                    i += len;
+                    continue;
+                }
+                // Inline HTML is out of subset unless re-serializable; a bare
+                // `<` followed by space/punct is plain text.
                 let next = bytes.get(i + 1).copied();
                 // An inline HTML element is re-serialized to match kramdown:
                 // void → ` />`, raw-content (`<code>`/…) → escaped body, and

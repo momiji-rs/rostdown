@@ -89,9 +89,34 @@ fn non_void_inline_with_markdown_content() {
 }
 
 #[test]
+fn autolinks() {
+    // kramdown's :autolink — `<scheme:…>` (mailto/http/https/ftp/ftps) and
+    // bare `<user@host>` — runs before span HTML, escapes the href + visible
+    // text, and `mailto:`-prefixes the bare-email form.
+    ok(
+        "see <http://example.com> now\n",
+        "<p>see <a href=\"http://example.com\">http://example.com</a> now</p>\n",
+    );
+    ok(
+        "q <https://x.io/a?b=1&c=2> e\n",
+        "<p>q <a href=\"https://x.io/a?b=1&amp;c=2\">https://x.io/a?b=1&amp;c=2</a> e</p>\n",
+    );
+    ok(
+        "mail <a.b-c@ex_ample.com> me\n",
+        "<p>mail <a href=\"mailto:a.b-c@ex_ample.com\">a.b-c@ex_ample.com</a> me</p>\n",
+    );
+    ok(
+        "x <mailto:user@host.org> y\n",
+        "<p>x <a href=\"mailto:user@host.org\">user@host.org</a> y</p>\n",
+    );
+    // An unrecognized scheme / uppercase scheme is NOT an autolink — kramdown
+    // keeps it literal (escaped); we decline (safe fallback).
+    declined("no <notscheme://x> here\n");
+    declined("up <HTTPS://X> here\n");
+}
+
+#[test]
 fn inline_html_out_of_subset_declines() {
-    // Autolinks.
-    declined("see <http://example.com> now\n");
     // Comment / close-without-open.
     declined("a <!-- c --> b\n");
     declined("a </div> b\n");

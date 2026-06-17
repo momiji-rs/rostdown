@@ -546,6 +546,69 @@ pub(crate) fn serialize(src: &str) -> Option<(String, usize)> {
     Some((out, p.pos))
 }
 
+/// kramdown autolink at the start of `s` (`s[0] == '<'`): `<scheme:…>` with
+/// scheme ∈ `mailto`/`http`/`https`/`ftp`/`ftps`, or `<user@host>` with both
+/// sides drawn from `[[:alnum:]]-_.`. Returns the serialized
+/// `<a href="…">text</a>` and the byte length consumed (through the `>`).
+/// Mirrors `Kramdown::Parser::Kramdown::AUTOLINK_START` + `parse_autolink`:
+/// the href is `mailto:`-prefixed for the bare-email form, and the visible
+/// text drops a leading `mailto:`. `.`/ACHARS never match a newline, so the
+/// inner text may not cross a line.
+pub(crate) fn autolink_at(s: &str) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'<') {
+        return None;
+    }
+    let mut gt = 1;
+    while gt < b.len() && b[gt] != b'>' && b[gt] != b'\n' {
+        gt += 1;
+    }
+    if gt >= b.len() || b[gt] != b'>' || gt == 1 {
+        return None; // no closing `>` on this line, or empty `<>`
+    }
+    let inner = &s[1..gt];
+    let consumed = gt + 1;
+
+    // Scheme branch (`(mailto|https?|ftps?):` then `.+`). Case-sensitive, like
+    // the regex (no `i` flag). Check `https`/`ftps` before their prefixes.
+    let is_scheme = ["mailto:", "https:", "http:", "ftps:", "ftp:"]
+        .into_iter()
+        .any(|p| inner.strip_prefix(p).is_some_and(|rest| !rest.is_empty()));
+
+    let (href, text): (String, &str) = if is_scheme {
+        let text = inner.strip_prefix("mailto:").unwrap_or(inner);
+        (inner.to_string(), text)
+    } else if is_autolink_email(inner) {
+        (format!("mailto:{inner}"), inner)
+    } else {
+        return None;
+    };
+
+    let mut out = String::with_capacity(inner.len() + 24);
+    out.push_str("<a href=\"");
+    Parser::push_escaped_attr(&mut out, &href);
+    out.push_str("\">");
+    Parser::push_escaped_text(&mut out, text);
+    out.push_str("</a>");
+    Some((out, consumed))
+}
+
+/// `[[:alnum:]]-_.]+@[[:alnum:]]-_.]+` over ASCII: exactly one `@`, non-empty
+/// on both sides, every other byte an ASCII alnum / `-` / `_` / `.`. A
+/// non-ASCII char fails (kramdown's Unicode `[[:alnum:]]` is out of subset —
+/// decline rather than risk a near-miss).
+fn is_autolink_email(inner: &str) -> bool {
+    let Some(at) = inner.find('@') else {
+        return false;
+    };
+    let (user, host) = (&inner[..at], &inner[at + 1..]);
+    if user.is_empty() || host.is_empty() {
+        return false;
+    }
+    let achar = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.');
+    user.bytes().all(achar) && host.bytes().all(achar)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
