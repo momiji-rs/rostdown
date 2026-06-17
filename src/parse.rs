@@ -114,6 +114,9 @@ pub(crate) enum BlockKind<'a> {
     /// literal newline (kramdown's verbatim line joining).
     List {
         ordered: bool,
+        /// Loose list (a blank line separates items): each item's content
+        /// is wrapped in `<p>` (kramdown). Tight lists stay `<li>text</li>`.
+        loose: bool,
         items: Option<u32>,
     },
     /// Blockquote: index of the first child block (`None` ⇒ empty).
@@ -602,8 +605,12 @@ fn parse_blocks<'a>(
         // (their content column is digits+2, not a fixed strip
         // width).
         if let Some(ordered) = list_marker(line) {
-            let items = parse_list_items(ast, lines, &mut i, ordered)?;
-            emit_block!(BlockKind::List { ordered, items });
+            let (items, loose) = parse_list_items(ast, lines, &mut i, ordered)?;
+            emit_block!(BlockKind::List {
+                ordered,
+                loose,
+                items
+            });
             continue;
         }
 
@@ -1144,7 +1151,7 @@ fn parse_list_items<'a>(
     lines: &[&'a str],
     i: &mut usize,
     ordered: bool,
-) -> Result<Option<u32>, Error> {
+) -> Result<(Option<u32>, bool), Error> {
     // The items of THIS level, sibling-linked.
     let mut items = Chain::new();
     // The currently-open item: its index in the arena and a span Chain so
@@ -1153,21 +1160,53 @@ fn parse_list_items<'a>(
     let mut cur_item: Option<u32> = None;
     let mut cur_spans = Chain::new();
     let mut cur_has_child = false;
+    // `loose`: some adjacent item pair is blank-separated. `tight_adjacent`:
+    // some pair abuts with no blank. A list mixing both renders per-item in
+    // kramdown (out of subset) — we accept only uniformly tight or uniformly
+    // loose lists and decline the mix. `via_blank` flags that the next item
+    // was reached across a blank line.
+    let mut loose = false;
+    let mut tight_adjacent = false;
+    let mut via_blank = false;
     while *i < lines.len() {
         let l = lines[*i];
         if is_blank(l) {
-            // Blank: list ends here if followed by a non-item; a
-            // following same-level item would make the list LOOSE.
+            // A blank line between two items makes the whole list LOOSE
+            // (each item's content wraps in `<p>`); otherwise the list
+            // ends here.
             let mut j = *i;
             while j < lines.len() && is_blank(lines[j]) {
                 j += 1;
             }
-            if j < lines.len() && list_marker(lines[j]) == Some(ordered) {
-                return Err(declined("loose-list"));
+            // `* * *` / `- - -` look like a marker but are a horizontal
+            // rule that ends the list (kramdown), not a loose continuation.
+            if j < lines.len() && list_marker(lines[j]) == Some(ordered) && !is_hr(lines[j]) {
+                // A loose list whose items carry a nested child (or
+                // multiple blocks) is out of the v1 subset.
+                if cur_has_child {
+                    return Err(declined("loose-list-child"));
+                }
+                loose = true;
+                via_blank = true;
+                *i = j;
+                continue;
+            }
+            // A blank followed by an indented line is a second block of the
+            // current item (a multi-paragraph / nested-block item) — out of
+            // subset; decline rather than mis-parse it as a separate block.
+            if j < lines.len() && lines[j].starts_with(' ') {
+                return Err(declined("list-item-multiblock"));
             }
             break;
         }
         if list_marker(l) == Some(ordered) {
+            // A new item abutting the previous one (no blank between) is a
+            // tight adjacency; one reached across a blank was already
+            // recorded as loose.
+            if cur_item.is_some() && !via_blank {
+                tight_adjacent = true;
+            }
+            via_blank = false;
             let content = strip_marker(l, ordered);
             // Item content is block-level in kramdown — tables,
             // EOB markers, IALs etc. inside an item are out of
@@ -1239,6 +1278,10 @@ fn parse_list_items<'a>(
                     j += 1;
                 }
                 let child = if j < tail.len() {
+                    // A nested child inside a loose list is out of subset.
+                    if loose {
+                        return Err(declined("loose-list-child"));
+                    }
                     // Child list: recurse over the rest of the
                     // stripped tail. Deeper-indented lines inside
                     // recurse again; a trailing stripped non-marker
@@ -1246,7 +1289,12 @@ fn parse_list_items<'a>(
                     let child_ordered = list_marker(tail[j])
                         .expect("loop exit condition");
                     let mut k = j;
-                    let child_items = parse_list_items(ast, &tail, &mut k, child_ordered)?;
+                    let (child_items, child_loose) =
+                        parse_list_items(ast, &tail, &mut k, child_ordered)?;
+                    if child_loose {
+                        // A loose nested list is out of the v1 subset.
+                        return Err(declined("loose-nested-list"));
+                    }
                     if k < tail.len() {
                         // Content after the child list inside the
                         // same item (blank-separated etc.) — out of
@@ -1299,7 +1347,12 @@ fn parse_list_items<'a>(
     if let Some(prev) = cur_item {
         ast.items[prev as usize].spans = cur_spans.first();
     }
-    Ok(items.first())
+    // A list mixing blank-separated and abutting items renders per-item in
+    // kramdown — out of subset.
+    if loose && tight_adjacent {
+        return Err(declined("mixed-loose-tight-list"));
+    }
+    Ok((items.first(), loose))
 }
 
 /// Append an already-built span chain (head index `head`, or `None`) to

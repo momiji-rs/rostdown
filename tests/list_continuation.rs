@@ -93,10 +93,26 @@ fn ordered_indented_continuation() {
 // ---- Frontier: kramdown accepts, rostdown declines (never wrong) ----------
 
 #[test]
-fn declines_loose_lists() {
-    // Blank line between items ⇒ loose list (`<li><p>…</p></li>`).
-    declined("- a\n\n- b\n");
-    declined("1. a\n\n2. b\n");
+fn loose_lists() {
+    // A blank line between every adjacent pair ⇒ a uniformly loose list:
+    // each item's content wraps in `<p>`.
+    ok(
+        "- a\n\n- b\n",
+        "<ul>\n  <li>\n    <p>a</p>\n  </li>\n  <li>\n    <p>b</p>\n  </li>\n</ul>\n",
+    );
+    ok(
+        "1. a\n\n2. b\n",
+        "<ol>\n  <li>\n    <p>a</p>\n  </li>\n  <li>\n    <p>b</p>\n  </li>\n</ol>\n",
+    );
+}
+
+#[test]
+fn declines_mixed_and_multiblock_lists() {
+    // Mixing abutting and blank-separated items renders per-item in
+    // kramdown (some `<li>x</li>`, some `<li><p>x</p></li>`) — out of subset.
+    declined("- a\n- b\n\n- c\n");
+    // A multi-paragraph item (blank then an indented block) is out of subset.
+    declined("- a\n\n  more\n- b\n");
 }
 
 #[test]

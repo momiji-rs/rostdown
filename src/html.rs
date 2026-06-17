@@ -118,8 +118,12 @@ fn convert_blocks(
                 convert_spans(out, ast, *spans, hl.codespan_class());
                 out.push_str("</p>\n");
             }
-            BlockKind::List { ordered, items } => {
-                emit_list(out, ast, *items, *ordered, indent, hl);
+            BlockKind::List {
+                ordered,
+                loose,
+                items,
+            } => {
+                emit_list(out, ast, *items, *ordered, *loose, indent, hl);
             }
             BlockKind::Quote(inner) => {
                 push_pad(out, indent);
@@ -256,6 +260,7 @@ fn emit_list(
     ast: &Ast<'_>,
     items: Option<u32>,
     ordered: bool,
+    loose: bool,
     indent: usize,
     hl: &mut dyn CodeHighlighter,
 ) {
@@ -268,13 +273,26 @@ fn emit_list(
     while let Some(idx) = cur {
         let item = &ast.items[idx as usize];
         cur = item.next;
+        if loose {
+            // kramdown wraps each loose item's content in a `<p>`; loose
+            // lists in the v1 subset never carry a nested child.
+            push_pad(out, indent + 2);
+            out.push_str("<li>\n");
+            push_pad(out, indent + 4);
+            out.push_str("<p>");
+            convert_spans(out, ast, item.spans, hl.codespan_class());
+            out.push_str("</p>\n");
+            push_pad(out, indent + 2);
+            out.push_str("</li>\n");
+            continue;
+        }
         push_pad(out, indent + 2);
         out.push_str("<li>");
         convert_spans(out, ast, item.spans, hl.codespan_class());
         match &item.child {
             Some((c_ord, c_items)) => {
                 out.push('\n');
-                emit_list(out, ast, *c_items, *c_ord, indent + 4, hl);
+                emit_list(out, ast, *c_items, *c_ord, false, indent + 4, hl);
                 push_pad(out, indent + 2);
                 out.push_str("</li>\n");
             }
