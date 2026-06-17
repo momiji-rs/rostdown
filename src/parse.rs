@@ -815,6 +815,22 @@ fn parse_blocks<'a>(
                 .collect();
             let mut k = 0;
             let (items, loose) = parse_list_items(ast, &deindented, &mut k, ordered)?;
+            // The blanket base de-indent also strips a lazy continuation's
+            // OWN leading whitespace, but kramdown keeps a lazy line (indent
+            // below the item's content column) verbatim. Where a consumed
+            // non-marker line had leading space that the de-indent erased,
+            // our parse would drop it — decline rather than emit a space-off
+            // line. (Indented continuations keep a residual space; markers
+            // are structural; both are fine.)
+            if (0..k).any(|n| {
+                let de = deindented[n];
+                !is_blank(de)
+                    && list_marker(de).is_none()
+                    && lines[i + n].starts_with(' ')
+                    && !de.starts_with(' ')
+            }) {
+                return Err(declined("opt-space-list-continuation"));
+            }
             emit_block!(BlockKind::List {
                 ordered,
                 loose,

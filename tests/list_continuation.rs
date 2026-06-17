@@ -117,6 +117,15 @@ fn indented_opt_space_lists() {
         "  1. x\n  2. y\n",
         "<ol>\n  <li>x</li>\n  <li>y</li>\n</ol>\n",
     );
+    // …but a lazy continuation in an opt-space list whose own leading
+    // whitespace the base de-indent would erase declines: kramdown keeps a
+    // lazy line verbatim (`item\n cont`), and the de-indent would drop the
+    // space. An indented continuation (residual space kept) still renders.
+    declined(" - item one\n as part two\n");
+    ok(
+        " - item one\n   indented cont\n",
+        "<ul>\n  <li>item one\nindented cont</li>\n</ul>\n",
+    );
 }
 
 #[test]
