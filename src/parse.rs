@@ -981,6 +981,14 @@ fn parse_blocks<'a>(
                 return Err(declined("core-paragraph-swallow"));
             }
             if !first && opt_space_opener(l, opts) {
+                // GFM's paragraph_end includes (OPT_SPACE-indented) list,
+                // blockquote, and fence starts — they interrupt the
+                // paragraph, so end it here and let the block loop parse the
+                // opener. Core's paragraph_end is blank-only, so there the
+                // opener is out of subset (declines).
+                if opts.gfm {
+                    break;
+                }
                 return Err(declined("opt-space-block"));
             }
             // Setext underlines would silently turn this paragraph into

@@ -138,6 +138,17 @@ fn declines_mixed_and_multiblock_lists() {
 }
 
 #[test]
+fn opt_space_list_interrupts_paragraph() {
+    // GFM: an OPT_SPACE-indented list start (`  - …`) directly after a
+    // paragraph line interrupts the paragraph (the list isn't swallowed as
+    // continuation text).
+    ok(
+        "intro text:\n  - item one\n  - item two\n",
+        "<p>intro text:</p>\n\n<ul>\n  <li>item one</li>\n  <li>item two</li>\n</ul>\n",
+    );
+}
+
+#[test]
 fn declines_emphasis_spanning_a_continuation() {
     // kramdown joins an item's lines, then parses inline — so `*` opening on
     // one physical line pairs with `*` on the next. Our zero-copy parse runs
