@@ -515,6 +515,7 @@ fn parse_blocks<'a>(
                         | BlockKind::Heading { .. }
                         | BlockKind::List { .. }
                         | BlockKind::Quote(_)
+                        | BlockKind::Table { .. }
                 )
             {
                 ast.blocks[idx as usize].ial = std::mem::take(&mut pending_ial);
@@ -567,7 +568,7 @@ fn parse_blocks<'a>(
                 // block (kramdown allows a block IAL on either side). Buffer
                 // it; `emit_block!` applies it to the next attachable block.
                 if pending_ial.is_empty()
-                    && line_starts_attachable_block(lines, i + 1, opts)
+                    && line_starts_attachable_block(lines, i + 1)
                 {
                     pending_ial = attrs;
                     i += 1;
@@ -1527,7 +1528,7 @@ fn extract_header_id(text: &str) -> Option<(&str, &str)> {
 /// list. Returns false for a blank, another IAL, a fence, indented code, an
 /// HR, an HTML block, or a table — those either orphan the IAL or render the
 /// attribute somewhere we don't model, so the caller declines instead.
-fn line_starts_attachable_block(lines: &[&str], idx: usize, opts: &Options) -> bool {
+fn line_starts_attachable_block(lines: &[&str], idx: usize) -> bool {
     let Some(&l) = lines.get(idx) else {
         return false;
     };
@@ -1543,11 +1544,12 @@ fn line_starts_attachable_block(lines: &[&str], idx: usize, opts: &Options) -> b
         || t.starts_with("~~~")
         || is_hr(l)
         || crate::html_block::starts_html_block(l)
-        || (has_table_pipe(t) && block_all_pipe(lines, idx, opts))
     {
         return false;
     }
     // Heading / blockquote / list marker / plain paragraph — all attachable.
+    // A pipe line is attachable too: it becomes a `<table>` (or a paragraph if
+    // not a clean table) and `emit_block!` carries the IAL onto either.
     true
 }
 

@@ -148,3 +148,13 @@ fn quote_ial_attaches_to_blockquote() {
         "<blockquote class=\"note\">\n  <p>line one\nline two</p>\n</blockquote>\n",
     );
 }
+
+#[test]
+fn leading_ial_attaches_to_a_table() {
+    // A block IAL directly above a pipe-table lands on the `<table>` tag
+    // (kramdown attaches a leading IAL to the following block, table included).
+    ok(
+        "{: .note}\nx | y\n",
+        "<table class=\"note\">\n  <tbody>\n    <tr>\n      <td>x</td>\n      <td>y</td>\n    </tr>\n  </tbody>\n</table>\n",
+    );
+}

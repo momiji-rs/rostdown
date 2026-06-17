@@ -198,25 +198,30 @@ fn convert_blocks(
                 aligns,
                 header,
                 body,
-            } => emit_table(out, ast, aligns, header, body, indent, hl),
+            } => emit_table(out, ast, aligns, header, body, &block.ial, indent, hl),
         }
     }
 }
 
 /// kramdown's `<table>` emission at a given base indent: `<thead>` (only when
 /// a header row exists), `<tbody>`, and the rows two levels deeper. Shared by
-/// the top-level table block and a pipe-table living inside a `<li>`.
+/// the top-level table block and a pipe-table living inside a `<li>`. A
+/// leading block IAL (`{: .note}` directly above the table) lands on `<table>`.
+#[allow(clippy::too_many_arguments)]
 fn emit_table(
     out: &mut String,
     ast: &Ast<'_>,
     aligns: &[Align],
     header: &Option<Vec<Option<u32>>>,
     body: &[Vec<Option<u32>>],
+    ial: &[(Cow<'_, str>, String)],
     indent: usize,
     hl: &mut dyn CodeHighlighter,
 ) {
     push_pad(out, indent);
-    out.push_str("<table>\n");
+    out.push_str("<table");
+    emit_attrs(out, ial);
+    out.push_str(">\n");
     if let Some(header) = header {
         push_pad(out, indent + 2);
         out.push_str("<thead>\n");
