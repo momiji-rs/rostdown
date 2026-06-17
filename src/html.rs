@@ -347,6 +347,19 @@ fn convert_spans(out: &mut String, ast: &Ast<'_>, head: Option<u32>, codespan_cl
                 convert_spans(out, ast, *spans, codespan_class);
                 out.push_str("</a>");
             }
+            SpanKind::Image { src, alt, title } => {
+                out.push_str("<img src=\"");
+                escape_attr(out, src);
+                out.push_str("\" alt=\"");
+                escape_attr(out, alt);
+                out.push('"');
+                if let Some(title) = title {
+                    out.push_str(" title=\"");
+                    escape_attr(out, title);
+                    out.push('"');
+                }
+                out.push_str(" />");
+            }
         }
     }
 }

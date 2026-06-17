@@ -190,6 +190,14 @@ pub(crate) enum SpanKind<'a> {
         /// no-title link.
         title: Option<Cow<'a, str>>,
     },
+    /// `![alt](src "title")` → `<img>`. `alt` is the raw bracket text
+    /// (kramdown does not parse markup inside it); all three are
+    /// HTML-attr-escaped at conversion.
+    Image {
+        src: Cow<'a, str>,
+        alt: Cow<'a, str>,
+        title: Option<Cow<'a, str>>,
+    },
 }
 
 /// Builds a sibling-linked chain in one of the arenas: tracks the first
@@ -773,6 +781,13 @@ fn copy_spans_owned<'a>(dst: &mut Ast<'a>, scratch: &Ast<'_>, head: Option<u32>)
             SpanKind::Link { spans, href, title } => SpanKind::Link {
                 spans: copy_spans_owned(dst, scratch, *spans),
                 href: Cow::Owned(href.clone().into_owned()),
+                title: title
+                    .as_ref()
+                    .map(|t| Cow::Owned(t.clone().into_owned())),
+            },
+            SpanKind::Image { src, alt, title } => SpanKind::Image {
+                src: Cow::Owned(src.clone().into_owned()),
+                alt: Cow::Owned(alt.clone().into_owned()),
                 title: title
                     .as_ref()
                     .map(|t| Cow::Owned(t.clone().into_owned())),
@@ -1796,7 +1811,20 @@ fn parse_spans_until<'a>(
                 }
             }
             b'!' if bytes.get(i + 1) == Some(&b'[') => {
-                return Err(declined("image"));
+                acc.flush(ast, &mut chain);
+                let rest = &text[i..];
+                if let Some((src, alt, title, len)) = parse_image(rest)? {
+                    let idx = ast.push_span(SpanKind::Image { src, alt, title });
+                    chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
+                    prev = Some(')');
+                    i += len;
+                } else {
+                    // Not an inline image → `!` is literal; resume after it
+                    // (the `[` is then handled by the bracket arm).
+                    acc.push_byte(i);
+                    prev = Some('!');
+                    i += 1;
+                }
             }
             b'<' => {
                 // Autolinks / inline HTML are out of subset; a bare `<`
@@ -2059,6 +2087,8 @@ pub(crate) fn spans_raw_text(ast: &Ast<'_>, spans: Option<u32>, out: &mut String
         let node = &ast.spans[idx as usize];
         match &node.kind {
             SpanKind::Text(t) | SpanKind::Code(t) => out.push_str(t),
+            // kramdown's GFM header-id slug ignores an image's alt text.
+            SpanKind::Image { .. } => {}
             SpanKind::Em(inner) | SpanKind::Strong(inner) | SpanKind::Link { spans: inner, .. } => {
                 spans_raw_text(ast, *inner, out);
             }
@@ -2069,6 +2099,56 @@ pub(crate) fn spans_raw_text(ast: &Ast<'_>, spans: Option<u32>, out: &mut String
 
 fn run_len(bytes: &[u8], i: usize, c: u8) -> usize {
     bytes[i..].iter().take_while(|b| **b == c).count()
+}
+
+/// Parse `![alt](src "title")` at the start of `rest` (`rest` begins with
+/// `![`). `alt` is the RAW bracket text — kramdown keeps markup literal in
+/// the alt attribute. Anything that isn't a clean inline image yields
+/// `None` so the caller renders `!` literally (reference-style images need
+/// a definition, and a doc that has one already declines).
+#[allow(clippy::type_complexity)]
+fn parse_image<'a>(
+    rest: &'a str,
+) -> Result<Option<(Cow<'a, str>, Cow<'a, str>, Option<Cow<'a, str>>, usize)>, Error> {
+    let bytes = rest.as_bytes();
+    debug_assert!(bytes.starts_with(b"!["));
+    // Closing `]` of the alt. Escaped / nested brackets are out of subset.
+    let mut close = None;
+    let mut k = 2;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'\\' => return Err(declined("image-alt-escape")),
+            b'[' => return Err(declined("image-alt-nested")),
+            b']' => {
+                close = Some(k);
+                break;
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    let Some(close) = close else {
+        return Ok(None);
+    };
+    if bytes.get(close + 1) != Some(&b'(') {
+        return Ok(None);
+    }
+    let after = &rest[close + 2..];
+    let Some(paren_rel) = after.find(')') else {
+        return Ok(None);
+    };
+    let Some((src, title)) = split_href_title(&after[..paren_rel]) else {
+        return Ok(None);
+    };
+    if src.contains('(') || src.starts_with('<') {
+        return Err(declined("image-dest"));
+    }
+    Ok(Some((
+        Cow::Borrowed(src),
+        Cow::Borrowed(&rest[2..close]),
+        title.map(Cow::Borrowed),
+        close + 2 + paren_rel + 1,
+    )))
 }
 
 /// Parse `[text](href)` at the start of `rest`. Titles, references and
@@ -2287,6 +2367,26 @@ mod byte_opt_tests {
         assert_eq!(split_href_title("  spaces.html  "), Some(("spaces.html", None)));
         // malformed: quote present, trailing junk after the close quote
         assert_eq!(split_href_title(r#"url "t" extra"#), None);
+    }
+
+    #[test]
+    fn parse_image_cases() {
+        // (verified byte-identical against kramdown 2.5.2)
+        let (src, alt, title, _) = parse_image("![alt](/i.png)").unwrap().unwrap();
+        assert_eq!((&*src, &*alt, title.as_deref()), ("/i.png", "alt", None));
+
+        let (src, alt, title, _) = parse_image(r#"![a](/i.png "t")"#).unwrap().unwrap();
+        assert_eq!((&*src, &*alt, title.as_deref()), ("/i.png", "a", Some("t")));
+
+        let (src, alt, _, _) = parse_image("![](u)").unwrap().unwrap();
+        assert_eq!((&*src, &*alt), ("u", ""));
+
+        // raw alt keeps markup literal (kramdown does not parse it)
+        let (_, alt, _, _) = parse_image("![a *b* c](u)").unwrap().unwrap();
+        assert_eq!(&*alt, "a *b* c");
+
+        // reference-style image (no `(`) ⇒ not an inline image
+        assert!(parse_image("![a][r]").unwrap().is_none());
     }
 
     #[test]
