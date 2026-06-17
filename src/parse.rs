@@ -611,6 +611,48 @@ fn parse_blocks<'a>(
             return Err(declined("table"));
         }
 
+        // Indented code block: a run of ≥4-space-indented lines at a block
+        // boundary (a line reaching here is a fresh block — a continuation
+        // would have been absorbed by the previous paragraph). Strip exactly
+        // four spaces per line; interior blank lines are kept when more
+        // indented code follows, trailing blanks end the block. Content is
+        // emitted as a `Code` block (escaped at render, like a fence). Gated
+        // to GFM (the gem profile): kramdown's CORE parser also takes
+        // non-indented LAZY continuations into the code block, which we don't
+        // model — so under core we keep declining.
+        if opts.gfm && line.starts_with("    ") {
+            let mut text = String::new();
+            let mut j = i;
+            let mut pending_blanks = 0usize;
+            while j < lines.len() {
+                let l = lines[j];
+                if is_blank(l) {
+                    pending_blanks += 1;
+                    j += 1;
+                    continue;
+                }
+                if !l.starts_with("    ") {
+                    break;
+                }
+                for _ in 0..pending_blanks {
+                    text.push('\n');
+                }
+                pending_blanks = 0;
+                text.push_str(&l[4..]);
+                text.push('\n');
+                j += 1;
+            }
+            // `j` advanced past the trailing blanks too; rewind so they
+            // remain blank separators between blocks.
+            let consumed = j - pending_blanks;
+            emit_block!(BlockKind::Code {
+                lang: None,
+                text: Cow::Owned(text),
+            });
+            i = consumed;
+            continue;
+        }
+
         decline_block_scan(line)?;
 
         // ATX heading.
