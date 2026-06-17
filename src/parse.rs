@@ -1144,8 +1144,10 @@ fn opt_space_opener(line: &str, opts: &Options) -> bool {
         return false;
     }
     let s = &line[n..];
-    s.starts_with('#')
-        || s.starts_with('>')
+    // An indented `#` is NOT a heading in kramdown (GFM or core) — it is
+    // ordinary paragraph text, kept verbatim — so it must NOT decline here;
+    // only the genuinely block-opening indented forms do.
+    s.starts_with('>')
         || list_marker(s).is_some()
         || (opts.gfm && s.starts_with("```"))
         || s.starts_with("~~~")
