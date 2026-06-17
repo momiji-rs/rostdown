@@ -1202,6 +1202,44 @@ fn copy_spans_owned<'a>(dst: &mut Ast<'a>, scratch: &Ast<'_>, head: Option<u32>)
     chain.first()
 }
 
+/// If `b[i]` opens a well-formed inline HTML tag (`<` then a letter or `/`,
+/// closing at a `>` on the same line, with `"`/`'` attribute values spanned),
+/// return the index just past the `>`; else `None`. Used by [`has_table_pipe`]
+/// (the table TRIGGER): a `|` inside an inline tag (`<a href="a|b">`) does not
+/// make the line a table row, so the block stays a paragraph. (Cell SPLITTING
+/// does not skip tags — once a line is a known table row, kramdown splits at
+/// every pipe.)
+fn skip_html_tag(b: &[u8], i: usize) -> Option<usize> {
+    if b.get(i) != Some(&b'<') {
+        return None;
+    }
+    match b.get(i + 1) {
+        Some(c) if c.is_ascii_alphabetic() || *c == b'/' => {}
+        _ => return None,
+    }
+    let mut j = i + 1;
+    let mut quote = 0u8;
+    while j < b.len() {
+        let c = b[j];
+        if quote != 0 {
+            match c {
+                _ if c == quote => quote = 0,
+                b'\n' => return None,
+                _ => {}
+            }
+        } else {
+            match c {
+                b'"' | b'\'' => quote = c,
+                b'>' => return Some(j + 1),
+                b'<' | b'\n' => return None, // not a clean single tag
+                _ => {}
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
 /// Constructs we recognize well enough to refuse: kramdown features
 /// outside the subset whose silent mis-parse would corrupt output.
 /// Split a table row into trimmed cell slices, honouring `\|` escapes and
@@ -1436,18 +1474,23 @@ fn try_parse_table<'a>(
             aligns[c] = a;
         }
     }
+    // A cell that won't span-parse (e.g. a `|` split mid-tag making an
+    // unclosed inline element: `<a href="a|b">` → cell `… <a href="a`) means
+    // this is NOT a table — kramdown renders the unsplit line as a paragraph,
+    // where the element is whole. Treat a cell parse error as "not a table"
+    // and fall through to the paragraph path (which re-parses the full line).
     let header = match header_line {
-        Some(h) => match table_row_spans(ast, h, ncols)? {
-            Some(r) => Some(r),
-            None => return Ok(None),
+        Some(h) => match table_row_spans(ast, h, ncols) {
+            Ok(Some(r)) => Some(r),
+            Ok(None) | Err(_) => return Ok(None),
         },
         None => None,
     };
     let mut rows = Vec::with_capacity(body.len());
     for &l in body {
-        match table_row_spans(ast, l, ncols)? {
-            Some(r) => rows.push(r),
-            None => return Ok(None),
+        match table_row_spans(ast, l, ncols) {
+            Ok(Some(r)) => rows.push(r),
+            Ok(None) | Err(_) => return Ok(None),
         }
     }
     Ok(Some((
@@ -1498,6 +1541,10 @@ fn has_table_pipe(t: &str) -> bool {
                     }
                 }
                 i = if closed { j } else { i + run };
+            }
+            b'<' => {
+                // A `|` inside an inline HTML tag is not a table pipe.
+                i = skip_html_tag(b, i).unwrap_or(i + 1);
             }
             b'|' => return true,
             _ => i += 1,

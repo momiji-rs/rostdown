@@ -121,3 +121,17 @@ fn pipe_in_list_item_builds_per_item_table() {
         "<ul>\n  <li>plain</li>\n  <li>\n    <table>\n      <tbody>\n        <tr>\n          <td>x</td>\n          <td>y</td>\n        </tr>\n      </tbody>\n    </table>\n  </li>\n</ul>\n",
     );
 }
+
+#[test]
+fn pipe_inside_inline_html_is_not_a_table() {
+    // A `|` inside an inline HTML tag's attribute is not a table separator —
+    // the line is an ordinary paragraph (the element is whole).
+    ok(
+        "Refer <a href=\"/x?a=1|2\">opts</a> here.\n",
+        "<p>Refer <a href=\"/x?a=1|2\">opts</a> here.</p>\n",
+    );
+    ok(
+        "x <a href=\"a|b\">link</a> y\n",
+        "<p>x <a href=\"a|b\">link</a> y</p>\n",
+    );
+}
