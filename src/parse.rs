@@ -203,6 +203,9 @@ pub(crate) enum SpanKind<'a> {
     /// Raw text (typography + escaping applied at conversion). Borrows a
     /// pristine `src` slice unless a rewrite forced materialization.
     Text(Cow<'a, str>),
+    /// Verbatim HTML emitted without escaping — an inline raw-HTML element
+    /// already re-serialized to match kramdown (see [`crate::html_block`]).
+    Raw(Cow<'a, str>),
     /// Emphasis: index of the first child span.
     Em(Option<u32>),
     /// Strong: index of the first child span.
@@ -1064,6 +1067,7 @@ fn copy_spans_owned<'a>(dst: &mut Ast<'a>, scratch: &Ast<'_>, head: Option<u32>)
         let node = &scratch.spans[idx as usize];
         let kind = match &node.kind {
             SpanKind::Text(t) => SpanKind::Text(Cow::Owned(t.clone().into_owned())),
+            SpanKind::Raw(t) => SpanKind::Raw(Cow::Owned(t.clone().into_owned())),
             SpanKind::Code(t) => SpanKind::Code(Cow::Owned(t.clone().into_owned())),
             SpanKind::Em(inner) => SpanKind::Em(copy_spans_owned(dst, scratch, *inner)),
             SpanKind::Strong(inner) => SpanKind::Strong(copy_spans_owned(dst, scratch, *inner)),
@@ -2239,6 +2243,19 @@ fn parse_spans_until<'a>(
                 // Autolinks / inline HTML are out of subset; a bare `<`
                 // followed by space/punct is plain text.
                 let next = bytes.get(i + 1).copied();
+                // An inline VOID HTML element (`<br>`, `<img …>`, `<wbr>`) is
+                // re-serialized as ` />` to match kramdown. Non-void inline
+                // HTML (markdown-parsed content) stays out of subset.
+                if next.is_some_and(|c| c.is_ascii_alphabetic())
+                    && let Some((html, len)) = crate::html_block::inline_void_at(&text[i..])
+                {
+                    acc.flush(ast, &mut chain);
+                    let idx = ast.push_span(SpanKind::Raw(Cow::Owned(html)));
+                    chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
+                    prev = Some('>');
+                    i += len;
+                    continue;
+                }
                 if next.is_some_and(|c| c.is_ascii_alphabetic() || c == b'/' || c == b'!') {
                     return Err(declined("inline-html-or-autolink"));
                 }
@@ -2538,6 +2555,8 @@ pub(crate) fn spans_raw_text(ast: &Ast<'_>, spans: Option<u32>, out: &mut String
         let node = &ast.spans[idx as usize];
         match &node.kind {
             SpanKind::Text(t) | SpanKind::Code(t) => out.push_str(t),
+            // Raw inline HTML contributes nothing to a heading's slug text.
+            SpanKind::Raw(_) => {}
             // kramdown's GFM header-id slug ignores an image's alt text.
             SpanKind::Image { .. } => {}
             SpanKind::Em(inner) | SpanKind::Strong(inner) | SpanKind::Link { spans: inner, .. } => {

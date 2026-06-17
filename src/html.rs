@@ -350,6 +350,7 @@ fn convert_spans(out: &mut String, ast: &Ast<'_>, head: Option<u32>, codespan_cl
         cur = span.next;
         match &span.kind {
             SpanKind::Text(t) => escape_text(out, t),
+            SpanKind::Raw(html) => out.push_str(html),
             SpanKind::Em(inner) => {
                 out.push_str("<em");
                 emit_span_ial(out, ast, idx);

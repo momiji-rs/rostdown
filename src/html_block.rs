@@ -423,6 +423,46 @@ fn find_close_ci(s: &str, name: &str) -> Option<usize> {
     None
 }
 
+/// Serialize an inline VOID HTML element at the start of `s` (`s[0] == '<'`,
+/// next byte a letter) — `<br>` / `<br/>` → `<br />`, `<img src=x>` →
+/// `<img src="x" />` — returning the serialization and bytes consumed.
+/// `None` if it isn't a clean void-element tag (non-void name, malformed
+/// attributes, `markdown=`, no `>`). Inline NON-void HTML (with markdown
+/// content) is out of this subset and handled (declined) by the caller.
+pub(crate) fn inline_void_at(s: &str) -> Option<(String, usize)> {
+    let mut p = Parser {
+        b: s.as_bytes(),
+        s,
+        pos: 0,
+    };
+    if p.peek() != Some(b'<') {
+        return None;
+    }
+    p.pos += 1;
+    if !p.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let name_start = p.pos;
+    while p
+        .peek()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == b'-')
+    {
+        p.pos += 1;
+    }
+    let name = s[name_start..p.pos].to_ascii_lowercase();
+    if !is_void(&name) {
+        return None;
+    }
+    let mut out = String::with_capacity(name.len() + 8);
+    out.push('<');
+    out.push_str(&name);
+    // Serialize/normalize attributes (consumes through the closing `>` or
+    // self-closing `/>`); a void element always re-serializes as ` />`.
+    p.attributes(&mut out)?;
+    out.push_str(" />");
+    Some((out, p.pos))
+}
+
 /// Serialize one top-level HTML block at the start of `src` (which begins at
 /// column 0 with a block-start tag). Returns the serialized HTML and the
 /// number of bytes consumed, requiring the close tag to land at a line
