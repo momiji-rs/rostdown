@@ -136,3 +136,18 @@ fn loose_nesting_and_lazy_join_to_deepest_item() {
         "<ul>\n  <li>a\n    <ul>\n      <li>b\ncont</li>\n    </ul>\n  </li>\n</ul>\n",
     );
 }
+
+#[test]
+fn tight_item_with_block_content() {
+    // A tight item that is a paragraph followed by a block (code / heading /
+    // blockquote, absorbed as a column-0 lazy block) renders inline-then-block,
+    // exactly like a paragraph + nested list.
+    ok(
+        "1. first\n2. text:\n```sh\ncode\n```\n",
+        "<ol>\n  <li>first</li>\n  <li>text:\n    <pre><code class=\"language-sh\">code\n</code></pre>\n  </li>\n</ol>\n",
+    );
+    ok(
+        "- a\n> quote\n",
+        "<ul>\n  <li>a\n    <blockquote>\n      <p>quote</p>\n    </blockquote>\n  </li>\n</ul>\n",
+    );
+}

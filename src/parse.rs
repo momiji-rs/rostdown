@@ -1571,7 +1571,10 @@ fn block_all_pipe(lines: &[&str], start: usize, opts: &Options) -> bool {
                 || l.starts_with("~~~")
                 || crate::html_block::starts_html_block(l))
         {
-            break;
+            // A block-starter cuts the pipe run short: kramdown forms a table
+            // only when the rows end at a blank line or end-of-input, so an
+            // interrupted run is a paragraph, not a (declined) table.
+            return false;
         }
         if !has_table_pipe(trim_start_ws(l)) {
             return false;
@@ -1872,32 +1875,23 @@ fn item_ends_with_list(ast: &Ast<'_>, blocks: Option<u32>) -> bool {
     last_is_list
 }
 
-/// A tight list item renders inline only for these shapes: a single
-/// paragraph; a paragraph then one or more nested lists; or a single
-/// non-paragraph block (e.g. a pipe-table). Anything else (paragraph then a
-/// non-list block, multiple paragraphs) has no inline form here.
+/// A tight list item renders inline only for these shapes: a leading
+/// paragraph followed by any blocks (rendered `<li>text\n{blocks}…</li>`, as
+/// kramdown does for a sub-list, code block, heading, blockquote, …), or a
+/// single non-paragraph block (e.g. a pipe-table). A tight item that opens
+/// with a non-paragraph block AND has more blocks has no inline form here.
 fn tight_item_shape_ok(ast: &Ast<'_>, blocks: Option<u32>) -> bool {
     let Some(head) = blocks else {
         return true; // empty item
     };
-    let mut cur = Some(head);
-    let mut first = true;
-    let mut first_is_para = false;
-    while let Some(b) = cur {
-        let node = &ast.blocks[b as usize];
-        match (&node.kind, first) {
-            (BlockKind::Para(_), true) => first_is_para = true,
-            (BlockKind::List { .. }, false) if first_is_para => {}
-            (_, true) => {
-                // A single non-paragraph block is fine only if it's alone.
-                return node.next.is_none();
-            }
-            _ => return false,
-        }
-        first = false;
-        cur = node.next;
+    let node = &ast.blocks[head as usize];
+    match node.kind {
+        // Leading paragraph: any trailing blocks render block-form below it.
+        BlockKind::Para(_) => true,
+        // A single non-paragraph block (table/code/…) renders block-form; more
+        // than one with no leading paragraph is out of subset.
+        _ => node.next.is_none(),
     }
-    true
 }
 
 /// Append an already-built span chain (head index `head`, or `None`) to

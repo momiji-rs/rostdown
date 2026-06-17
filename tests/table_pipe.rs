@@ -72,6 +72,25 @@ fn quirky_tables_decline() {
 }
 
 #[test]
+fn pipe_line_interrupted_by_block_is_a_paragraph() {
+    // kramdown forms a table only when the rows end at a blank/EOF. A pipe
+    // line cut short by a block-starter is a paragraph (with literal pipes),
+    // even a separator row can't rescue it.
+    ok(
+        "x | y | z\n- item\n",
+        "<p>x | y | z</p>\n<ul>\n  <li>item</li>\n</ul>\n",
+    );
+    ok(
+        "x | y | z\n# heading\n",
+        "<p>x | y | z</p>\n<h1 id=\"heading\">heading</h1>\n",
+    );
+    ok(
+        "a | b\n---|---\nc | d\n- item\n",
+        "<p>a | b\n—|—\nc | d</p>\n<ul>\n  <li>item</li>\n</ul>\n",
+    );
+}
+
+#[test]
 fn multiline_pipe_list_item() {
     // An item whose continuation lines are ALSO pipe-rows builds a multi-row
     // table inside the `<li>` (the recursive item parse runs the table builder
