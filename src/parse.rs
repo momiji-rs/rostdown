@@ -1752,12 +1752,7 @@ fn parse_spans_until<'a>(
                 if run_len(bytes, i, c) > 1 {
                     return Err(declined("quote-run"));
                 }
-                let next = text[i + 1..].chars().next();
-                let q = if c == b'\'' {
-                    typography::single_quote(prev, next)?
-                } else {
-                    typography::double_quote(prev, next)?
-                };
+                let q = typography::smart_quote(prev, c == b'\'', &text[i + 1..])?;
                 // Smart quote: the emitted char (U+2018..U+201D) always
                 // differs from the ASCII source byte — a rewrite.
                 acc.push_char(q, i, i + 1);
