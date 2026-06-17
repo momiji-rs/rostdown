@@ -4,6 +4,7 @@
 //! leave partial output.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use crate::{Error, Options, typography};
 
@@ -32,11 +33,18 @@ use crate::{Error, Options, typography};
 /// found. Each speculative recursion records `ast.spans.len()` first and
 /// `truncate`s back to it on revert, so abandoned nodes never leak into
 /// the arena or the output.
+/// Link reference definitions: normalized id → (url, optional title),
+/// the url/title borrowing from `src`.
+type LinkDefs<'a> = HashMap<String, (&'a str, Option<&'a str>)>;
+
 #[derive(Debug, Default)]
 pub(crate) struct Ast<'a> {
     pub(crate) blocks: Vec<BlockNode<'a>>,
     pub(crate) spans: Vec<SpanNode<'a>>,
     pub(crate) items: Vec<ItemNode<'a>>,
+    /// `[id]: url "title"` definitions, collected in a pre-pass and keyed
+    /// by normalized id. Empty for the common doc with none.
+    pub(crate) link_defs: LinkDefs<'a>,
 }
 
 impl<'a> Ast<'a> {
@@ -56,6 +64,7 @@ impl<'a> Ast<'a> {
             blocks: Vec::with_capacity(src_len / 40 + 8),
             spans: Vec::with_capacity(src_len / 12 + 16),
             items: Vec::with_capacity(src_len / 256 + 4),
+            link_defs: HashMap::new(),
         }
     }
 
@@ -272,7 +281,21 @@ pub(crate) fn parse<'a>(src: &'a str, opts: &Options) -> Result<(Ast<'a>, Option
         _ => &lines[..],
     };
     let mut ast = Ast::with_capacity_for(src.len());
-    let root = parse_blocks(&mut ast, src, lines, opts)?;
+    // Pre-pass: lift block-level link reference definitions out of the
+    // stream so the surrounding blank lines collapse the way kramdown's
+    // do, and so `[text][id]` / `[text]` resolve during span parsing.
+    let (defs, def_mask) = collect_link_defs(lines);
+    let root = if defs.is_empty() {
+        parse_blocks(&mut ast, src, lines, opts)?
+    } else {
+        ast.link_defs = defs;
+        let filtered: Vec<&'a str> = lines
+            .iter()
+            .zip(&def_mask)
+            .filter_map(|(&l, &is_def)| (!is_def).then_some(l))
+            .collect();
+        parse_blocks(&mut ast, src, &filtered, opts)?
+    };
     Ok((ast, root))
 }
 
@@ -1140,13 +1163,9 @@ fn decline_block_scan(line: &str) -> Result<(), Error> {
     if t.starts_with(": ") || t == ":" {
         return Err(declined("definition-list"));
     }
-    // Link definitions `[id]: url`.
-    if t.starts_with('[')
-        && let Some(close) = t.find(']')
-        && t[close + 1..].starts_with(':')
-    {
-        return Err(declined("link-definition"));
-    }
+    // Block-level link reference definitions are lifted out in a pre-pass
+    // (see collect_link_defs); a `[id]: url`-looking line that reaches here
+    // is mid-paragraph and stays literal text, exactly as in kramdown.
     // Raw HTML blocks (a line opening with a tag).
     let bytes = t.as_bytes();
     if bytes.first() == Some(&b'<')
@@ -1839,7 +1858,7 @@ fn parse_spans_until<'a>(
             b'!' if bytes.get(i + 1) == Some(&b'[') => {
                 acc.flush(ast, &mut chain);
                 let rest = &text[i..];
-                if let Some((src, alt, title, len)) = parse_image(rest)? {
+                if let Some((src, alt, title, len)) = parse_image(ast, rest)? {
                     let idx = ast.push_span(SpanKind::Image { src, alt, title });
                     chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
                     prev = Some(')');
@@ -2127,6 +2146,100 @@ fn run_len(bytes: &[u8], i: usize, c: u8) -> usize {
     bytes[i..].iter().take_while(|b| **b == c).count()
 }
 
+/// Normalize a link-reference id the way kramdown does: lowercase, with
+/// internal whitespace runs collapsed to one space and the ends trimmed.
+fn normalize_ref_id(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_ws = true; // also trims leading whitespace
+    for c in s.chars() {
+        if c.is_whitespace() {
+            prev_ws = true;
+        } else {
+            if prev_ws && !out.is_empty() {
+                out.push(' ');
+            }
+            out.extend(c.to_lowercase());
+            prev_ws = false;
+        }
+    }
+    out
+}
+
+/// Parse a link reference definition: `[id]: url`, with `url` bare or in
+/// `<…>`, an optional `"title"` / `'title'` / `(title)`, behind ≤3 spaces.
+/// `None` unless the whole line is a clean single-line definition.
+fn parse_link_def(line: &str) -> Option<(String, &str, Option<&str>)> {
+    let lead = line.len() - line.trim_start_matches(' ').len();
+    if lead > 3 {
+        return None; // ≥4 spaces is indented code, not a definition
+    }
+    let t = line[lead..].strip_prefix('[')?;
+    let close = t.find(']')?;
+    let id = normalize_ref_id(&t[..close]);
+    if id.is_empty() {
+        return None;
+    }
+    let rest = t[close + 1..].strip_prefix(':')?.trim_start_matches([' ', '\t']);
+    // Destination: `<…>` (angle-bracketed) or bare up to whitespace.
+    let (url, after_url) = if let Some(r) = rest.strip_prefix('<') {
+        let end = r.find('>')?;
+        (&r[..end], &r[end + 1..])
+    } else {
+        match rest.find(char::is_whitespace) {
+            Some(p) => (&rest[..p], &rest[p..]),
+            None => (rest, ""),
+        }
+    };
+    if url.is_empty() {
+        return None;
+    }
+    // Optional title; anything else after the destination ⇒ not a def.
+    let after = after_url.trim_start_matches([' ', '\t']);
+    let title = if after.is_empty() {
+        None
+    } else {
+        let closer = match after.as_bytes()[0] {
+            b'"' => b'"',
+            b'\'' => b'\'',
+            b'(' => b')',
+            _ => return None,
+        };
+        let inner = &after[1..];
+        let end = inner.bytes().position(|b| b == closer)?;
+        if !inner[end + 1..].trim_matches([' ', '\t']).is_empty() {
+            return None;
+        }
+        Some(&inner[..end])
+    };
+    Some((id, url, title))
+}
+
+/// Pre-pass: collect block-level link reference definitions and mark each
+/// definition's line for removal from the block stream. A definition is
+/// recognized only at a block boundary (document start, after a blank, or
+/// after another definition); a `[id]: url`-looking line in the middle of
+/// a paragraph stays literal text.
+fn collect_link_defs<'a>(lines: &[&'a str]) -> (LinkDefs<'a>, Vec<bool>) {
+    let mut map: LinkDefs<'a> = HashMap::new();
+    let mut mask = vec![false; lines.len()];
+    let mut at_boundary = true;
+    for (idx, &line) in lines.iter().enumerate() {
+        if is_blank(line) {
+            at_boundary = true;
+            continue;
+        }
+        if at_boundary
+            && let Some((id, url, title)) = parse_link_def(line)
+        {
+            map.entry(id).or_insert((url, title)); // first definition wins
+            mask[idx] = true;
+            continue; // stay at a boundary: consecutive defs all count
+        }
+        at_boundary = false;
+    }
+    (map, mask)
+}
+
 /// Parse `![alt](src "title")` at the start of `rest` (`rest` begins with
 /// `![`). `alt` is the RAW bracket text — kramdown keeps markup literal in
 /// the alt attribute. Anything that isn't a clean inline image yields
@@ -2134,6 +2247,7 @@ fn run_len(bytes: &[u8], i: usize, c: u8) -> usize {
 /// a definition, and a doc that has one already declines).
 #[allow(clippy::type_complexity)]
 fn parse_image<'a>(
+    ast: &Ast<'a>,
     rest: &'a str,
 ) -> Result<Option<(Cow<'a, str>, Cow<'a, str>, Option<Cow<'a, str>>, usize)>, Error> {
     let bytes = rest.as_bytes();
@@ -2156,8 +2270,41 @@ fn parse_image<'a>(
     let Some(close) = close else {
         return Ok(None);
     };
+    let alt = &rest[2..close];
+    // `]` not followed by `(`: reference image (full / collapsed /
+    // shortcut) resolved against the collected definitions, else literal.
     if bytes.get(close + 1) != Some(&b'(') {
-        return Ok(None);
+        let (id, consumed) = match bytes.get(close + 1) {
+            Some(b'[') => {
+                let inner = &rest[close + 2..];
+                let Some(idc) = inner.find(']') else {
+                    return Ok(None);
+                };
+                let explicit = &inner[..idc];
+                let id = if explicit.trim_matches([' ', '\t']).is_empty() {
+                    normalize_ref_id(alt)
+                } else {
+                    normalize_ref_id(explicit)
+                };
+                (id, close + 2 + idc + 1)
+            }
+            _ => {
+                let tail = &rest[close + 1..];
+                if tail.starts_with([' ', '\t']) && tail.trim_start().starts_with('[') {
+                    return Err(declined("ref-space-separated"));
+                }
+                (normalize_ref_id(alt), close + 1)
+            }
+        };
+        let Some(&(src, title)) = ast.link_defs.get(&id) else {
+            return Ok(None);
+        };
+        return Ok(Some((
+            Cow::Borrowed(src),
+            Cow::Borrowed(alt),
+            title.map(Cow::Borrowed),
+            consumed,
+        )));
     }
     let after = &rest[close + 2..];
     let Some(paren_rel) = after.find(')') else {
@@ -2209,15 +2356,14 @@ fn parse_link<'a>(
         }
         k += 1;
     }
-    // Unclosed bracket, or `]` not followed by `(`: not an inline link.
-    // kramdown then renders the `[` literally — reference-style links need
-    // a link definition, and a doc that has one already declines — so we
-    // signal "not a link" and let the caller emit `[` as text.
+    // Unclosed bracket: not a link — the caller emits `[` literally.
     let Some(close) = close else {
         return Ok(None);
     };
+    // `]` not followed by `(`: try a reference link (full / collapsed /
+    // shortcut) against the collected definitions, else literal `[`.
     if bytes.get(close + 1) != Some(&b'(') {
-        return Ok(None);
+        return resolve_ref_link(ast, rest, close, in_em, in_strong);
     }
     let after = &rest[close + 2..];
     let Some(paren_rel) = after.find(')') else {
@@ -2243,6 +2389,59 @@ fn parse_link<'a>(
         Cow::Borrowed(href),
         title.map(Cow::Borrowed),
         close + 2 + paren_rel + 1,
+    )))
+}
+
+/// Resolve a reference link at `rest` whose text closes at `close` (the
+/// `]`), which is NOT followed by `(`: full `[text][id]`, collapsed
+/// `[text][]`, or shortcut `[text]`. Looks the normalized id up in the
+/// collected definitions; an undefined reference yields `None` (literal
+/// `[`). The `] [id]` space-separated full form is rare — decline it.
+#[allow(clippy::type_complexity)]
+fn resolve_ref_link<'a>(
+    ast: &mut Ast<'a>,
+    rest: &'a str,
+    close: usize,
+    in_em: bool,
+    in_strong: bool,
+) -> Result<Option<(Option<u32>, Cow<'a, str>, Option<Cow<'a, str>>, usize)>, Error> {
+    let bytes = rest.as_bytes();
+    let text = &rest[1..close];
+    let (id, consumed) = match bytes.get(close + 1) {
+        Some(b'[') => {
+            // full `[text][id]` / collapsed `[text][]`
+            let inner = &rest[close + 2..];
+            let Some(idc) = inner.find(']') else {
+                return Ok(None);
+            };
+            let explicit = &inner[..idc];
+            let id = if explicit.trim_matches([' ', '\t']).is_empty() {
+                normalize_ref_id(text)
+            } else {
+                normalize_ref_id(explicit)
+            };
+            (id, close + 2 + idc + 1)
+        }
+        _ => {
+            // shortcut `[text]`; `] <ws> [` is the space-separated full
+            // form (out of subset) — decline rather than mis-resolve.
+            let tail = &rest[close + 1..];
+            if tail.starts_with([' ', '\t']) && tail.trim_start().starts_with('[') {
+                return Err(declined("ref-space-separated"));
+            }
+            (normalize_ref_id(text), close + 1)
+        }
+    };
+    let Some(&(href, title)) = ast.link_defs.get(&id) else {
+        return Ok(None);
+    };
+    let (spans, _) =
+        parse_spans_until(ast, text, None, in_em, in_strong, Some(Elem::Link))?;
+    Ok(Some((
+        spans,
+        Cow::Borrowed(href),
+        title.map(Cow::Borrowed),
+        consumed,
     )))
 }
 
@@ -2324,7 +2523,10 @@ mod byte_opt_tests {
         assert_eq!(reason("[^1]: footnote"), Some("footnote"));
         assert_eq!(reason("$$ math $$"), Some("math"));
         assert_eq!(reason("<div>"), Some("html-block"));
-        assert_eq!(reason("[id]: http://x"), Some("link-definition"));
+        // Link reference definitions are lifted out in a pre-pass, not
+        // declined here; a def-shaped line that reaches the block scan is
+        // mid-paragraph and stays literal text.
+        assert_eq!(reason("[id]: http://x"), None);
     }
 
     #[test]
@@ -2398,21 +2600,40 @@ mod byte_opt_tests {
     #[test]
     fn parse_image_cases() {
         // (verified byte-identical against kramdown 2.5.2)
-        let (src, alt, title, _) = parse_image("![alt](/i.png)").unwrap().unwrap();
+        let ast = Ast::new(); // empty defs ⇒ a reference image is undefined
+        let (src, alt, title, _) = parse_image(&ast, "![alt](/i.png)").unwrap().unwrap();
         assert_eq!((&*src, &*alt, title.as_deref()), ("/i.png", "alt", None));
 
-        let (src, alt, title, _) = parse_image(r#"![a](/i.png "t")"#).unwrap().unwrap();
+        let (src, alt, title, _) = parse_image(&ast, r#"![a](/i.png "t")"#).unwrap().unwrap();
         assert_eq!((&*src, &*alt, title.as_deref()), ("/i.png", "a", Some("t")));
 
-        let (src, alt, _, _) = parse_image("![](u)").unwrap().unwrap();
+        let (src, alt, _, _) = parse_image(&ast, "![](u)").unwrap().unwrap();
         assert_eq!((&*src, &*alt), ("u", ""));
 
         // raw alt keeps markup literal (kramdown does not parse it)
-        let (_, alt, _, _) = parse_image("![a *b* c](u)").unwrap().unwrap();
+        let (_, alt, _, _) = parse_image(&ast, "![a *b* c](u)").unwrap().unwrap();
         assert_eq!(&*alt, "a *b* c");
 
-        // reference-style image (no `(`) ⇒ not an inline image
-        assert!(parse_image("![a][r]").unwrap().is_none());
+        // reference-style image with no matching definition ⇒ not inline
+        assert!(parse_image(&ast, "![a][r]").unwrap().is_none());
+    }
+
+    #[test]
+    fn link_def_and_ref_id() {
+        // (verified byte-identical against kramdown 2.5.2)
+        assert_eq!(normalize_ref_id("  A  B  "), "a b");
+        assert_eq!(parse_link_def("[id]: /url"), Some(("id".into(), "/url", None)));
+        assert_eq!(
+            parse_link_def(r#"[A B]: /u "t""#),
+            Some(("a b".into(), "/u", Some("t")))
+        );
+        assert_eq!(
+            parse_link_def("[a]: <http://x.com>"),
+            Some(("a".into(), "http://x.com", None))
+        );
+        assert_eq!(parse_link_def("  [a]: /u"), Some(("a".into(), "/u", None))); // ≤3 indent
+        assert_eq!(parse_link_def("    [a]: /u"), None); // 4 spaces ⇒ code
+        assert_eq!(parse_link_def("not a def"), None);
     }
 
     #[test]
