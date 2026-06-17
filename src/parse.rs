@@ -1657,25 +1657,36 @@ fn chain_extend_spans(ast: &mut Ast<'_>, chain: &mut Chain, head: Option<u32>) {
     chain.last = Some(tail);
 }
 
-/// Whether the top-level span chain `head` carries a bare emphasis/code
-/// delimiter (`*` or backtick) in a Text node — a marker the per-line parse
-/// couldn't pair within its own physical line. In a multi-line list item
-/// such a marker may pair with one on another line under kramdown's
-/// join-then-parse, which our zero-copy per-line parse can't reproduce
-/// (the joined text would need an owned buffer outliving the borrow), so
-/// the item declines. `_` is deliberately excluded: intra-word underscores
-/// (`runtime_deps`) are literal in both engines and would over-decline.
+/// Whether the top-level span chain `head` carries an inline delimiter the
+/// per-line parse couldn't pair within its own physical line: a bare `*` or
+/// backtick in a Text node, or an unbalanced `[`/`]` count (a link whose
+/// brackets straddle the line break). In a multi-line list item such a
+/// delimiter pairs with one on another line under kramdown's
+/// join-then-parse, which our zero-copy per-line parse can't reproduce (the
+/// joined text would need an owned buffer outliving the `&'a src` borrow),
+/// so the item declines.
+///
+/// `_` is deliberately excluded — intra-word underscores (`runtime_deps`)
+/// are literal in both engines and would over-decline. Balanced brackets
+/// (`arr[0]`, an unresolved `[note]`) stay literal in both engines, so only
+/// an imbalance — the genuine cross-line-link signal — trips this.
 fn chain_has_bare_marker(ast: &Ast<'_>, head: Option<u32>) -> bool {
     let mut cur = head;
+    let mut bracket_depth: i32 = 0;
     while let Some(idx) = cur {
-        if let SpanKind::Text(t) = &ast.spans[idx as usize].kind
-            && t.bytes().any(|b| b == b'*' || b == b'`')
-        {
-            return true;
+        if let SpanKind::Text(t) = &ast.spans[idx as usize].kind {
+            for b in t.bytes() {
+                match b {
+                    b'*' | b'`' => return true,
+                    b'[' => bracket_depth += 1,
+                    b']' => bracket_depth -= 1,
+                    _ => {}
+                }
+            }
         }
         cur = ast.spans[idx as usize].next;
     }
-    false
+    bracket_depth != 0
 }
 
 fn list_marker(line: &str) -> Option<bool> {

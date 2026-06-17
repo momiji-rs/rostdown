@@ -139,6 +139,19 @@ fn declines_emphasis_spanning_a_continuation() {
     declined("- a **strong\n  across** b\n");
     // Bare marker on the marker line, closer on the continuation.
     declined("- start *here\n  there*\n");
+    // An inline link whose brackets straddle the line break.
+    declined("- see [the\n  docs](http://x)\n");
+    declined("1. accurately [set the timezone\n   codes](/win)\n");
+}
+
+#[test]
+fn balanced_brackets_in_continuation_still_ok() {
+    // Balanced brackets that don't span the join stay literal in both
+    // engines, so the item still renders (no over-decline).
+    ok(
+        "- see arr[0] for\n  more info\n",
+        "<ul>\n  <li>see arr[0] for\nmore info</li>\n</ul>\n",
+    );
 }
 
 #[test]
