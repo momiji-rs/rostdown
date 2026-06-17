@@ -186,6 +186,12 @@ fn convert_blocks(
                 push_pad(out, indent);
                 out.push_str("<hr />\n");
             }
+            BlockKind::RawHtml(html) => {
+                // Already serialized to match kramdown's HTML converter
+                // (parsed at column 0, top level) — emit verbatim.
+                out.push_str(html);
+                out.push('\n');
+            }
             BlockKind::Table {
                 aligns,
                 header,

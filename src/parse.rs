@@ -149,6 +149,9 @@ pub(crate) enum BlockKind<'a> {
         lang: Option<Cow<'a, str>>,
         text: Cow<'a, str>,
     },
+    /// A raw HTML block, already re-serialized to match kramdown's HTML
+    /// converter (see [`crate::html_block`]). Emitted verbatim.
+    RawHtml(String),
     Hr,
     /// A kramdown/GFM pipe table in the common shape: an optional header
     /// row (when a separator line underlines it), per-column alignment,
@@ -550,6 +553,22 @@ fn parse_blocks<'a>(
             continue;
         }
 
+        // A raw HTML block opening (column 0) with a block-level element. We
+        // re-serialize the supported subset to match kramdown's GFM-parser
+        // HTML handling; anything else falls through to the html-block
+        // decline. Gated to GFM (the gem profile): kramdown's CORE parser
+        // normalizes HTML-block whitespace differently, so under core we
+        // keep declining rather than mis-render.
+        if opts.gfm && crate::html_block::starts_html_block(line) {
+            let off = offset_in(src, line);
+            if let Some((html, consumed)) = crate::html_block::serialize(&src[off..]) {
+                let lines_used = 1 + src[off..off + consumed].bytes().filter(|&c| c == b'\n').count();
+                emit_block!(BlockKind::RawHtml(html));
+                i += lines_used;
+                continue;
+            }
+        }
+
         decline_block_scan(line)?;
 
         // ATX heading.
@@ -888,7 +907,8 @@ fn parse_blocks<'a>(
                     || l.starts_with('>')
                     || list_marker(l).is_some()
                     || l.starts_with("```")
-                    || l.starts_with("~~~"))
+                    || l.starts_with("~~~")
+                    || crate::html_block::starts_html_block(l))
             {
                 break;
             }
@@ -2451,6 +2471,10 @@ fn normalize_ref_id(s: &str) -> String {
 /// A well-formed numeric reference that overflows / is out of range still
 /// returns `Some` with an invalid code point so the caller declines (rather
 /// than mis-emitting a literal `&`, which kramdown would not).
+pub(crate) fn parse_entity_at(s: &str) -> Option<(u32, usize)> {
+    parse_entity(s)
+}
+
 fn parse_entity(s: &str) -> Option<(u32, usize)> {
     let b = s.as_bytes();
     debug_assert_eq!(b.first(), Some(&b'&'));
