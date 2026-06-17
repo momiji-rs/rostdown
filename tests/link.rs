@@ -87,12 +87,17 @@ fn quirky_destinations_decline() {
 }
 
 #[test]
-fn smart_quote_after_code_span_declines() {
-    // A `'`/`"` directly after a code span sits on a boundary kramdown
-    // classifies with its SQ_RULES (`` `x`'d `` opens, `` `x`'s `` closes) —
-    // out of subset, declined rather than mis-quoted. (A code span NOT
-    // followed by a quote, and a normal smart quote, still render.)
-    declined("a `code`'d here\n");
+fn smart_quote_after_code_span() {
+    // A `'`/`"` directly after a code span has no preceding char in kramdown's
+    // SQ_RULES, so it is classified at-start (lookahead only): `` `x`'s `` →
+    // ’s (possessive, closing), `` `x`'d `` → ‘d (opening), `` `x`"q" `` →
+    // “q”.
+    ok("a `code`'s here\n", "<p>a <code>code</code>\u{2019}s here</p>\n");
+    ok("a `code`'d here\n", "<p>a <code>code</code>\u{2018}d here</p>\n");
+    ok(
+        "a `code`\"q\" here\n",
+        "<p>a <code>code</code>\u{201c}q\u{201d} here</p>\n",
+    );
     ok("a `code` then text\n", "<p>a <code>code</code> then text</p>\n");
 }
 

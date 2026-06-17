@@ -2554,18 +2554,16 @@ fn parse_spans_until<'a>(
                 if run_len(bytes, i, c) > 1 {
                     return Err(declined("quote-run"));
                 }
-                // A smart quote immediately after a code span sits on a
-                // boundary kramdown classifies with its intricate SQ_RULES
-                // (e.g. `` `x`'d `` opens but `` `x`'s `` closes) — we can't
-                // reproduce that reliably, so decline.
-                if acc.is_empty()
+                // A smart quote directly after a code span has NO preceding
+                // character in kramdown's SQ_RULES scan (the span consumed
+                // it), so classify it as at-start — lookahead-only rules
+                // (`` `x`'s `` → ’s, `` `x`'d `` → ‘d, `` `x`"q" `` → “q”).
+                let after_code = acc.is_empty()
                     && chain
                         .last
-                        .is_some_and(|l| matches!(ast.spans[l as usize].kind, SpanKind::Code(_)))
-                {
-                    return Err(declined("quote-after-code"));
-                }
-                let q = typography::smart_quote(prev, c == b'\'', &text[i + 1..])?;
+                        .is_some_and(|l| matches!(ast.spans[l as usize].kind, SpanKind::Code(_)));
+                let prev_for_quote = if after_code { None } else { prev };
+                let q = typography::smart_quote(prev_for_quote, c == b'\'', &text[i + 1..])?;
                 // Smart quote: the emitted char (U+2018..U+201D) always
                 // differs from the ASCII source byte — a rewrite.
                 acc.push_char(q, i, i + 1);
