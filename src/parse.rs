@@ -744,14 +744,23 @@ fn parse_blocks<'a>(
         // (GFM) or tildes; kramdown closes it with a run of the SAME char
         // at least as long, carrying no info string — so a ```` ```` ````
         // line closes a ``` ``` ``` fence.
-        let fence_char = match line.as_bytes().first() {
+        // kramdown ignores 1–3 leading spaces (OPT_SPACE) before the opening
+        // fence (GFM); the body is kept VERBATIM (not de-indented). Under
+        // core, only a column-0 fence is in subset.
+        let fence_indent = line.len() - line.trim_start_matches(' ').len();
+        let fline = if (fence_indent == 0 || opts.gfm) && fence_indent <= 3 {
+            &line[fence_indent..]
+        } else {
+            line
+        };
+        let fence_char = match fline.as_bytes().first() {
             Some(&b'`') if opts.gfm => Some(b'`'),
             Some(&b'~') => Some(b'~'),
             _ => None,
         };
-        let fence_len = fence_char.map_or(0, |c| run_len(line.as_bytes(), 0, c));
+        let fence_len = fence_char.map_or(0, |c| run_len(fline.as_bytes(), 0, c));
         if let Some(fence_char) = fence_char.filter(|_| fence_len >= 3) {
-            let info = line[fence_len..].trim();
+            let info = fline[fence_len..].trim();
             if info.contains('`') || info.contains('{') {
                 return Err(declined("fence-info"));
             }
@@ -781,8 +790,15 @@ fn parse_blocks<'a>(
                 let l = lines[i];
                 // Closing fence: a run of the same char, at least as long
                 // as the opener, and nothing else (info strings are not
-                // allowed on a closing fence).
-                let t = trim_end_ws(l);
+                // allowed on a closing fence). Under GFM the close may carry
+                // 1–3 leading spaces (OPT_SPACE), mirroring the opener.
+                let cl = if opts.gfm {
+                    let b = l.trim_start_matches(' ');
+                    if l.len() - b.len() <= 3 { b } else { l }
+                } else {
+                    l
+                };
+                let t = trim_end_ws(cl);
                 if t.len() >= fence_len && t.bytes().all(|b| b == fence_char) {
                     closed = true;
                     break;
@@ -1571,9 +1587,10 @@ fn decline_block_scan(line: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Block openers kramdown accepts behind 1–3 leading spaces
-/// (OPT_SPACE). Fences are column-0 in kramdown, so declining the
-/// indented form is conservative-safe.
+/// Block openers kramdown accepts behind 1–3 leading spaces (OPT_SPACE).
+/// A *standalone* opt-space fence is parsed directly by the fence handler;
+/// this predicate governs the remaining mid-paragraph / list-continuation
+/// contexts, where the indented opener still declines (conservative-safe).
 fn opt_space_opener(line: &str, opts: &Options) -> bool {
     let n = line.len() - line.trim_start_matches(' ').len();
     if !(1..=3).contains(&n) {

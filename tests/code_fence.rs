@@ -49,3 +49,41 @@ fn shorter_run_inside_longer_fence_is_content() {
         "<pre><code>inner ```\nstill code\n</code></pre>\n",
     );
 }
+
+#[test]
+fn opt_space_indented_opening_fence() {
+    // kramdown ignores 1–3 leading spaces (OPT_SPACE) before the opener; the
+    // info string is read from the de-indented fence. Common shape: a fence
+    // nested under a Liquid block's indentation.
+    ok(
+        "  ```js\nconst x = 1;\n  ```\n",
+        "<pre><code class=\"language-js\">const x = 1;\n</code></pre>\n",
+    );
+    // 3-space opener + 3-space close, no info.
+    ok("   ```\ndeep\n   ```\n", "<pre><code>deep\n</code></pre>\n");
+    // Tilde fence, indented.
+    ok("  ~~~\ntilde\n  ~~~\n", "<pre><code>tilde\n</code></pre>\n");
+}
+
+#[test]
+fn opt_space_fence_content_is_verbatim() {
+    // The body is NOT de-indented — content lines are kept exactly, even when
+    // more or less indented than the opening fence.
+    ok(
+        "  ```ruby\n    deeper\n  level\n  ```\n",
+        "<pre><code class=\"language-ruby\">    deeper\n  level\n</code></pre>\n",
+    );
+}
+
+#[test]
+fn opt_space_open_and_close_indents_may_differ() {
+    // The opener's and closer's 0–3 indents are independent.
+    ok(
+        "   ```\nmismatch\n```\n",
+        "<pre><code>mismatch\n</code></pre>\n",
+    );
+    ok(
+        "```\nplain\n   ```\n",
+        "<pre><code>plain\n</code></pre>\n",
+    );
+}
