@@ -1806,7 +1806,11 @@ fn parse_spans_until<'a>(
                     return Err(declined("inline-html-or-autolink"));
                 }
                 if next == Some(b'<') {
-                    // kramdown typography turns `<<`/`>>` into guillemets.
+                    // kramdown turns `<<`/`>>` into guillemets and folds an
+                    // adjacent space into a non-breaking space (`<< ` → «\u{a0},
+                    // ` >>` → \u{a0}»). The trailing-space case needs a
+                    // backward rewrite the forward-only text accumulator
+                    // can't do, so decline rather than emit a near-miss.
                     return Err(declined("guillemets"));
                 }
                 acc.push_byte(i); // literal `<`, verbatim
