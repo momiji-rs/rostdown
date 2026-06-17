@@ -76,6 +76,26 @@ fn opt_space_fence_content_is_verbatim() {
 }
 
 #[test]
+fn info_string_is_a_single_token() {
+    // kramdown's info is one `\S+` token; the language class drops a `?query`
+    // and keeps other punctuation verbatim.
+    ok(
+        "~~~ruby?foo=1\nx\n~~~\n",
+        "<pre><code class=\"language-ruby\">x\n</code></pre>\n",
+    );
+    ok(
+        "~~~{:.cls}\nx\n~~~\n",
+        "<pre><code class=\"language-{:.cls}\">x\n</code></pre>\n",
+    );
+    ok("~~~c++ \nx\n~~~\n", "<pre><code class=\"language-c++\">x\n</code></pre>\n");
+    // A second token (internal whitespace) means it is NOT a fence opener —
+    // kramdown renders the line as a paragraph; we (still) decline rather than
+    // wrongly emit a `<pre>` with a truncated language.
+    declined("~~~ruby extra\nx\n~~~\n");
+    declined("~~~{% raw %}\ncode\n~~~\n");
+}
+
+#[test]
 fn opt_space_open_and_close_indents_may_differ() {
     // The opener's and closer's 0–3 indents are independent.
     ok(

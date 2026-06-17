@@ -768,17 +768,25 @@ fn parse_blocks<'a>(
             _ => None,
         };
         let fence_len = fence_char.map_or(0, |c| run_len(fline.as_bytes(), 0, c));
-        if let Some(fence_char) = fence_char.filter(|_| fence_len >= 3) {
-            let info = fline[fence_len..].trim();
-            if info.contains('`') || info.contains('{') {
-                return Err(declined("fence-info"));
-            }
-            let lang = if info.is_empty() {
-                None
-            } else {
-                // The info-string's first word is a sub-slice of the line.
-                Some(Cow::Borrowed(info.split_whitespace().next().unwrap_or("")))
-            };
+        // kramdown's info string is a SINGLE `\S+` token followed only by
+        // whitespace; a second token (internal whitespace, e.g. `~~~{% raw %}`)
+        // means the line is NOT a fence opener but an ordinary paragraph. The
+        // language class is the token up to a `?query` (`ruby?x` → `ruby`),
+        // with other punctuation (`{:.cls}`, `c++`) kept verbatim. A backtick
+        // fence (GFM) may not carry a backtick in its info. `Some(lang)` ⇒ this
+        // IS a fence (with optional language); `None` ⇒ fall through.
+        let fence_lang: Option<Option<Cow<'a, str>>> =
+            fence_char.filter(|_| fence_len >= 3).and_then(|fc| {
+                let rest = fline[fence_len..].trim_start();
+                let token = rest.split_whitespace().next().unwrap_or("");
+                if !rest[token.len()..].trim().is_empty() || (fc == b'`' && token.contains('`')) {
+                    return None;
+                }
+                Some(token.split('?').next().filter(|t| !t.is_empty()).map(Cow::Borrowed))
+            });
+        if let (Some(fence_char), Some(lang)) =
+            (fence_char.filter(|_| fence_len >= 3), fence_lang)
+        {
             i += 1;
             // Track the first/last CONTENT line so the body — every
             // content line plus its trailing `\n` — can be borrowed as
