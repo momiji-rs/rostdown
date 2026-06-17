@@ -174,20 +174,15 @@ pub(crate) enum Align {
     Right,
 }
 
-/// One tight-list item in the flat arena. `spans` is the first child
-/// span; `child` is the first item of an optional trailing nested list;
-/// `next` links to the following sibling item.
+/// One list item in the flat arena. `blocks` is the first block of the item's
+/// content — recursively parsed, so an item may hold a paragraph, several
+/// blocks, a nested list, a table, code, etc. `next` links to the following
+/// sibling item. Whether each item renders inline (`<li>text</li>`) or in
+/// block form (`<li>\n…\n</li>`) is decided at render time from the list's
+/// tight/loose flag and the item's block shape.
 #[derive(Debug)]
 pub(crate) struct ItemNode<'a> {
-    pub(crate) spans: Option<u32>,
-    /// Trailing nested list: `(ordered, first_item_index)`. Tight items
-    /// carry at most text-then-one-child in our subset; anything richer
-    /// (blank lines, content after the child) declines first.
-    pub(crate) child: Option<(bool, Option<u32>)>,
-    /// A block-level element filling the item (a pipe-table kramdown builds
-    /// from a `|`-bearing item line). When set, `spans`/`child` are unused and
-    /// the item renders in block form. Indexes [`Ast::blocks`].
-    pub(crate) block: Option<u32>,
+    pub(crate) blocks: Option<u32>,
     pub(crate) next: Option<u32>,
     /// Lifetime tie: an `ItemNode` with all-`None` index fields would
     /// otherwise be `'static`. Keeps `'a` bound to `src`.
@@ -937,7 +932,7 @@ fn parse_blocks<'a>(
         // (their content column is digits+2, not a fixed strip
         // width).
         if let Some(ordered) = list_marker(line) {
-            let (items, loose) = parse_list_items(ast, lines, &mut i, ordered, opts)?;
+            let (items, loose) = parse_list_items(ast, src, lines, &mut i, ordered, opts)?;
             emit_block!(BlockKind::List {
                 ordered,
                 loose,
@@ -960,7 +955,7 @@ fn parse_blocks<'a>(
                 .map(|l| l.strip_prefix(pad).unwrap_or(l))
                 .collect();
             let mut k = 0;
-            let (items, loose) = parse_list_items(ast, &deindented, &mut k, ordered, opts)?;
+            let (items, loose) = parse_list_items(ast, src, &deindented, &mut k, ordered, opts)?;
             // The blanket base de-indent also strips a lazy continuation's
             // OWN leading whitespace, but kramdown keeps a lazy line (indent
             // below the item's content column) verbatim. Where a consumed
@@ -1143,8 +1138,23 @@ fn parse_blocks<'a>(
 /// (blockquote / list bodies whose de-prefixed source lines don't abut
 /// contiguously). Parses into a scratch [`Ast`], then copies the chain
 /// in, remapping indices and `into_owned`-ing the Cows.
-fn parse_spans_owned<'a>(ast: &mut Ast<'a>, joined: &str) -> Result<Option<u32>, Error> {
-    let mut scratch = Ast::new();
+fn parse_spans_owned<'a, 'j>(
+    ast: &mut Ast<'a>,
+    joined: &'j str,
+) -> Result<Option<u32>, Error>
+where
+    'a: 'j,
+{
+    let mut scratch: Ast<'j> = Ast::new();
+    // Give the scratch parse the document's link reference definitions so a
+    // `[text][id]` on a de-prefixed line (a list/blockquote continuation that
+    // had to be joined into an owned buffer) still resolves. The def urls
+    // borrow `src`, which outlives `joined`, so they reborrow to `'j`.
+    scratch.link_defs = ast
+        .link_defs
+        .iter()
+        .map(|(k, &(url, title))| (k.clone(), (url, title)))
+        .collect();
     let head = parse_spans(&mut scratch, joined)?;
     Ok(copy_spans_owned(ast, &scratch, head))
 }
@@ -1346,6 +1356,7 @@ fn try_parse_table<'a>(
     // Collect the contiguous run; every line must be a row or separator,
     // else the whole block is a paragraph (kramdown), not a table.
     let mut end = start;
+    let mut interrupted = false;
     while end < lines.len() {
         let l = lines[end];
         if is_blank(l) {
@@ -1359,6 +1370,11 @@ fn try_parse_table<'a>(
                 || l.starts_with("```")
                 || l.starts_with("~~~"))
         {
+            // A block-starter (list/heading/quote/fence) cut the run short.
+            // kramdown forms a GFM table only when its rows end at a blank line
+            // or end-of-input; interrupted this way, the whole run is a
+            // paragraph (even with a separator line).
+            interrupted = true;
             break;
         }
         if trim_start_ws(l).starts_with('+') {
@@ -1384,6 +1400,11 @@ fn try_parse_table<'a>(
             }
             sep_idx = Some(k);
         }
+    }
+    // A run cut short by a block-starter (no trailing blank) is a paragraph in
+    // kramdown, not a table — even when a separator line is present.
+    if interrupted {
+        return Ok(None);
     }
     let (header_line, align_line, body): (Option<&str>, Option<&str>, &[&str]) = match sep_idx {
         None => (None, None, run),
@@ -1669,299 +1690,214 @@ fn is_hr(line: &str) -> bool {
     count >= 3
 }
 
-/// `Some(ordered?)` when the line opens a list item.
-/// Collect the items of one (tight) list level starting at
-/// `lines[*i]`. Shares the old inline loop's decline rules; the
-/// marker-indented tail of an item (stripped by exactly the
-/// unordered content column, 2) parses as lazy-continuation text
-/// followed by at most one nested child list — which recurses
-/// through this same fn, so deeper nesting works and a deeper
-/// continuation line attaches to the DEEPEST open item
-/// (kramdown's behaviour, probed: `- a` / `  - b` / `    cont`
-/// joins `cont` onto b).
+/// Collect the items of one list level starting at `lines[*i]`, returning
+/// `(first_item_index, loose)`. Each item's content lines (de-indented by the
+/// marker's content column, with lazy/indented continuations and internal
+/// blanks) are parsed RECURSIVELY via [`parse_blocks`], so an item may hold a
+/// paragraph, several blocks, a nested list, a pipe-table, code, etc. A list
+/// is LOOSE when any item is blank-separated from the next or itself contains
+/// a blank between blocks (kramdown then wraps each item's content in `<p>`).
+/// Genuinely ambiguous indentations (tabs, 1-space markers, ordered markers
+/// whose content column exceeds the indent) still decline, keeping output
+/// byte-identical-or-declined.
 fn parse_list_items<'a>(
     ast: &mut Ast<'a>,
+    src: &'a str,
     lines: &[&'a str],
     i: &mut usize,
     ordered: bool,
     opts: &Options,
 ) -> Result<(Option<u32>, bool), Error> {
-    // The items of THIS level, sibling-linked.
     let mut items = Chain::new();
-    // The currently-open item: its index in the arena and a span Chain so
-    // lazy continuations can append to its span run after it was pushed.
-    // `None` until the first item opens.
-    let mut cur_item: Option<u32> = None;
-    let mut cur_spans = Chain::new();
-    let mut cur_has_child = false;
-    // `loose`: some adjacent item pair is blank-separated. `tight_adjacent`:
-    // some pair abuts with no blank. A list mixing both renders per-item in
-    // kramdown (out of subset) — we accept only uniformly tight or uniformly
-    // loose lists and decline the mix. `via_blank` flags that the next item
-    // was reached across a blank line.
+    let mut item_idxs: Vec<u32> = Vec::new();
+    // `loose`: an item is blank-separated from the next, or itself spans a
+    // blank between blocks. `tight_adjacent`: some pair abuts with no blank.
+    // A list mixing both renders per-item in kramdown — out of subset.
     let mut loose = false;
+    // `between_loose`: looseness came from a blank line BETWEEN two items (vs
+    // an internal blank inside one item). Only this kind, combined with a
+    // sub-list-ending item, triggers kramdown's per-item tight/loose mixing.
+    let mut between_loose = false;
     let mut tight_adjacent = false;
     let mut via_blank = false;
     while *i < lines.len() {
         let l = lines[*i];
         if is_blank(l) {
-            // A blank line between two items makes the whole list LOOSE
-            // (each item's content wraps in `<p>`); otherwise the list
-            // ends here.
             let mut j = *i;
             while j < lines.len() && is_blank(lines[j]) {
                 j += 1;
             }
-            // `* * *` / `- - -` look like a marker but are a horizontal
-            // rule that ends the list (kramdown), not a loose continuation.
+            // `* * *` looks like a marker but is a horizontal rule — ends the
+            // list. A blank then a sibling marker continues the list. kramdown
+            // makes it LOOSE only when the blank directly follows the previous
+            // item's PARAGRAPH content; a blank that follows the previous
+            // item's trailing nested sub-list is absorbed and stays tight
+            // (`- a\n  - x\n\n- b` is tight).
             if j < lines.len() && list_marker(lines[j]) == Some(ordered) && !is_hr(lines[j]) {
-                // A loose list whose items carry a nested child (or
-                // multiple blocks) is out of the v1 subset.
-                if cur_has_child {
-                    return Err(declined("loose-list-child"));
+                let prev_ends_with_list = item_idxs
+                    .last()
+                    .is_some_and(|&p| item_ends_with_list(ast, ast.items[p as usize].blocks));
+                if !prev_ends_with_list {
+                    loose = true;
+                    between_loose = true;
                 }
-                loose = true;
                 via_blank = true;
                 *i = j;
                 continue;
             }
-            // A blank followed by an indented line is a second block of the
-            // current item (a multi-paragraph / nested-block item) — out of
-            // subset; decline rather than mis-parse it as a separate block.
-            if j < lines.len() && lines[j].starts_with(' ') {
-                return Err(declined("list-item-multiblock"));
-            }
             break;
         }
         if list_marker(l) == Some(ordered) {
-            // A new item abutting the previous one (no blank between) is a
-            // tight adjacency; one reached across a blank was already
-            // recorded as loose.
-            if cur_item.is_some() && !via_blank {
+            if !item_idxs.is_empty() && !via_blank {
                 tight_adjacent = true;
             }
             via_blank = false;
-            let mut content = strip_marker(l, ordered);
-            // Is this item exactly one line? Its next line must end the item —
-            // blank, end-of-input, or a same-kind sibling marker. Anything else
-            // (a lazy/indented continuation) makes it a multi-line item, where
-            // several behaviours below (a `|`-table, trailing-ws hard breaks)
-            // become context-dependent and stay out of subset.
-            let single_line = match lines.get(*i + 1) {
-                None => true,
-                Some(nl) => is_blank(nl) || list_marker(nl) == Some(ordered),
-            };
-            // Item content is block-level in kramdown — EOB markers, IALs etc.
-            // inside an item are out of subset, same as at the top level. A
-            // `|` makes kramdown render a `<table>` inside the `<li>`: support
-            // the common single-line item (no indented continuation) by
-            // building a one-row table; the multi-line / indented form stays
-            // out of subset (decline).
-            if has_table_pipe(trim_start_ws(content)) {
-                // kramdown makes a `<table>` inside the `<li>` only when EVERY
-                // line of the item's content is a pipe-row — i.e. a single-line
-                // item here.
-                if !single_line {
-                    return Err(declined("table"));
+            let first = strip_marker(l, ordered);
+            let content_col = l.len() - first.len();
+            // Gather the item's content lines, de-indented by `content_col`.
+            let mut content: Vec<&'a str> = vec![first];
+            *i += 1;
+            let mut internal_blank = false;
+            while *i < lines.len() {
+                let cl = lines[*i];
+                if is_blank(cl) {
+                    let mut j = *i;
+                    while j < lines.len() && is_blank(lines[j]) {
+                        j += 1;
+                    }
+                    let nxt_indented = j < lines.len()
+                        && lines[j].as_bytes().first() != Some(&b'\t')
+                        && (lines[j].len() - lines[j].trim_start_matches(' ').len()) >= content_col;
+                    if nxt_indented {
+                        // Internal blank(s): the item continues with another
+                        // block at the content column — a multi-block item.
+                        content.resize(content.len() + (j - *i), "");
+                        internal_blank = true;
+                        *i = j;
+                        continue;
+                    }
+                    break; // trailing blank → the outer loop classifies it
                 }
-                let Some((table_kind, _)) = try_parse_table(ast, &[content], 0, opts)? else {
-                    return Err(declined("table"));
-                };
-                if let Some(prev) = cur_item {
-                    ast.items[prev as usize].spans = cur_spans.first();
+                if cl.as_bytes().first() == Some(&b'\t') {
+                    return Err(declined("list-tab-indent"));
                 }
-                let bidx = ast.push_block(table_kind);
-                let item_idx = ast.push_item(ItemNode {
-                    spans: None,
-                    child: None,
-                    block: Some(bidx),
-                    next: None,
-                    _marker: std::marker::PhantomData,
-                });
-                items.link(item_idx, |p, n| ast.items[p as usize].next = Some(n));
-                cur_item = Some(item_idx);
-                cur_spans = Chain::new();
-                cur_has_child = false;
-                *i += 1;
-                continue;
-            }
-            decline_block_scan(content)?;
-            // Trailing whitespace on an item line: on a single-line item it is
-            // simply stripped (kramdown trims the last line — even 2+ spaces
-            // make no `<br />` with nothing to break to). On a multi-line item
-            // the trailing run carries hard-break semantics across the join,
-            // which we don't model — decline.
-            if trim_end_ws(content) != content {
-                if !single_line {
-                    return Err(declined("list-trailing-ws"));
+                let lead = cl.len() - cl.trim_start_matches(' ').len();
+                if lead >= content_col {
+                    content.push(&cl[content_col..]);
+                    *i += 1;
+                } else if lead == 0 && list_marker(cl) == Some(ordered) {
+                    break; // next sibling item
+                } else if lead == 0 && !cl.starts_with("{:") {
+                    // Column-0 lazy continuation: kramdown is aggressively lazy
+                    // — it joins a plain line onto the item's open paragraph and
+                    // even pulls a column-0 block (heading/quote/code) into the
+                    // DEEPEST open item. Collect it; the recursive parse builds
+                    // the right structure and the tight-shape check declines the
+                    // shapes we can't render.
+                    content.push(cl);
+                    *i += 1;
+                } else {
+                    // A `{:` IAL ends the list (the main loop attaches it); a
+                    // 1..content_col indent (ordered wide markers) is out of
+                    // our clean subset.
+                    if lead == 0 {
+                        break;
+                    }
+                    return Err(declined("list-continuation"));
                 }
-                content = trim_end_ws(content);
             }
-            // Flush the previous item's span tail back into its node
-            // before opening the next item.
-            if let Some(prev) = cur_item {
-                ast.items[prev as usize].spans = cur_spans.first();
+            if internal_blank {
+                loose = true;
             }
-            let mut spans = Chain::new();
-            let parsed = parse_spans(ast, content)?;
-            chain_extend_spans(ast, &mut spans, parsed);
-            let item_idx = ast.push_item(ItemNode {
-                spans: spans.first(),
-                child: None,
-                block: None,
+            while content.last() == Some(&"") {
+                content.pop();
+            }
+            let blocks = parse_blocks(ast, src, &content, opts)?;
+            let idx = ast.push_item(ItemNode {
+                blocks,
                 next: None,
                 _marker: std::marker::PhantomData,
             });
-            items.link(item_idx, |p, n| ast.items[p as usize].next = Some(n));
-            cur_item = Some(item_idx);
-            cur_spans = spans;
-            cur_has_child = false;
-            *i += 1;
-            // Marker-indented tail block: lines indented to at least the
-            // item's content column attach to THIS item, stripped by that
-            // column. The column is the marker width — 2 for `- `/`* `/
-            // `+ `, digits+2 for `1. ` — so ordered lists now carry an
-            // indented continuation / nested child, not just unordered.
-            // Tabs decline; an indent of 2..col (only reachable for ordered
-            // markers wider than 2) is kramdown's space-keeping lazy form,
-            // out of our clean subset.
-            let content_col = l.len() - content.len();
-            let mut tail: Vec<&str> = Vec::new();
-            while *i < lines.len() && !is_blank(lines[*i]) {
-                let tl = lines[*i];
-                if tl.starts_with('\t') {
-                    return Err(declined("list-tab-indent"));
-                }
-                let lead = tl.len() - tl.trim_start_matches(' ').len();
-                if lead < 2 {
-                    break;
-                }
-                if lead < content_col {
-                    return Err(declined("list-continuation"));
-                }
-                tail.push(&tl[content_col..]);
-                *i += 1;
-            }
-            if !tail.is_empty() {
-                let mut j = 0usize;
-                // Leading non-marker lines: lazy continuations of
-                // this item (kramdown joins them verbatim with a
-                // newline, indentation stripped).
-                while j < tail.len() && list_marker(tail[j]).is_none() {
-                    let cont = tail[j];
-                    if has_table_pipe(trim_start_ws(cont)) {
-                        return Err(declined("table"));
-                    }
-                    decline_block_scan(cont)?;
-                    if trim_end_ws(cont) != cont || cont.starts_with(' ') || cont.starts_with('\t') {
-                        return Err(declined("list-continuation-ws"));
-                    }
-                    let parsed = parse_spans(ast, cont)?;
-                    // A bare emphasis/code marker on either side of the join
-                    // would pair across the line break under kramdown; our
-                    // per-line parse leaves both literal, so decline.
-                    if chain_has_bare_marker(ast, parsed)
-                        || chain_has_bare_marker(ast, cur_spans.first())
-                    {
-                        return Err(declined("list-continuation-inline-span"));
-                    }
-                    let nl = ast.push_span(SpanKind::Text(Cow::Borrowed("\n")));
-                    cur_spans.link(nl, |p, n| ast.spans[p as usize].next = Some(n));
-                    chain_extend_spans(ast, &mut cur_spans, parsed);
-                    j += 1;
-                }
-                let child = if j < tail.len() {
-                    // A nested child inside a loose list is out of subset.
-                    if loose {
-                        return Err(declined("loose-list-child"));
-                    }
-                    // Child list: recurse over the rest of the
-                    // stripped tail. Deeper-indented lines inside
-                    // recurse again; a trailing stripped non-marker
-                    // line is the child's own lazy continuation.
-                    let child_ordered = list_marker(tail[j])
-                        .expect("loop exit condition");
-                    let mut k = j;
-                    let (child_items, child_loose) =
-                        parse_list_items(ast, &tail, &mut k, child_ordered, opts)?;
-                    if child_loose {
-                        // A loose nested list is out of the v1 subset.
-                        return Err(declined("loose-nested-list"));
-                    }
-                    if k < tail.len() {
-                        // Content after the child list inside the
-                        // same item (blank-separated etc.) — out of
-                        // subset.
-                        return Err(declined("list-after-child"));
-                    }
-                    Some((child_ordered, child_items))
-                } else {
-                    None
-                };
-                // Persist the (possibly extended) span tail and child.
-                let item = cur_item.expect("just pushed");
-                ast.items[item as usize].spans = cur_spans.first();
-                ast.items[item as usize].child = child;
-                cur_has_child = child.is_some();
-            }
+            items.link(idx, |p, n| ast.items[p as usize].next = Some(n));
+            item_idxs.push(idx);
         } else if l.starts_with(' ') {
-            // Sub-2-space indent (1 space): kramdown treats a
-            // 1-space marker as a SAME-level item; conservatively
-            // decline the whole family.
+            // A 1-space marker is a SAME-level item in kramdown; decline.
             return Err(declined("list-continuation"));
         } else if list_marker(l).is_some() {
             return Err(declined("mixed-list-markers"));
-        } else if l.starts_with("{:") && !l.starts_with("{::") {
-            // A block-IAL line abutting the list terminates it; the main
-            // loop then attaches the IAL to the emitted list block. (We
-            // only reach here at column 0 — indented `{:` was caught by the
-            // leading-space arm above.)
-            break;
         } else {
-            // Lazy continuation line appended to the last item.
-            if has_table_pipe(trim_start_ws(l)) {
-                return Err(declined("table"));
-            }
-            decline_block_scan(l)?;
-            if trim_end_ws(l) != l {
-                return Err(declined("list-continuation-ws"));
-            }
-            match cur_item {
-                Some(item) => {
-                    if cur_has_child {
-                        // Column-0 text after a nested child would
-                        // join the PARENT item in kramdown — out of
-                        // our emit shape.
-                        return Err(declined("list-after-child"));
-                    }
-                    let parsed = parse_spans(ast, l)?;
-                    // See the tail-continuation arm: a bare emphasis/code
-                    // marker that would pair across the line break declines.
-                    if chain_has_bare_marker(ast, parsed)
-                        || chain_has_bare_marker(ast, cur_spans.first())
-                    {
-                        return Err(declined("list-continuation-inline-span"));
-                    }
-                    let nl = ast.push_span(SpanKind::Text(Cow::Borrowed("\n")));
-                    cur_spans.link(nl, |p, n| ast.spans[p as usize].next = Some(n));
-                    chain_extend_spans(ast, &mut cur_spans, parsed);
-                    ast.items[item as usize].spans = cur_spans.first();
-                    *i += 1;
-                }
-                None => break,
-            }
+            // A column-0 non-marker line (a block IAL `{:…}`, or stray text):
+            // the list ends and the main loop handles it.
+            break;
         }
     }
-    // Persist the final open item's span tail.
-    if let Some(prev) = cur_item {
-        ast.items[prev as usize].spans = cur_spans.first();
-    }
-    // A list mixing blank-separated and abutting items renders per-item in
-    // kramdown — out of subset.
     if loose && tight_adjacent {
         return Err(declined("mixed-loose-tight-list"));
     }
+    // When looseness comes from a blank BETWEEN items and the list ALSO holds
+    // an item ending in a nested sub-list, kramdown switches to PER-ITEM
+    // tight/loose (the sub-list item and the trailing item stay inline) — a
+    // shape our single loose flag can't reproduce, so decline. (Looseness from
+    // an internal blank inside a single item renders fine and is not caught.)
+    if between_loose
+        && item_idxs.iter().any(|&p| item_ends_with_list(ast, ast.items[p as usize].blocks))
+    {
+        return Err(declined("list-loose-mixed"));
+    }
+    // Tight items render inline (`<li>text</li>`) or as `<li>text\n<ul>…`. Only
+    // a single paragraph, a paragraph followed by nested list(s), or a single
+    // non-paragraph block (a pipe-table / code) have a defined inline shape;
+    // any richer tight shape is out of subset.
+    if !loose {
+        for &idx in &item_idxs {
+            if !tight_item_shape_ok(ast, ast.items[idx as usize].blocks) {
+                return Err(declined("list-item-shape"));
+            }
+        }
+    }
     Ok((items.first(), loose))
+}
+
+/// Whether the item's block chain ends in a nested list. kramdown absorbs a
+/// blank line that follows such a trailing sub-list, so it does NOT make the
+/// outer list loose (`- a\n  - x\n\n- b` stays tight).
+fn item_ends_with_list(ast: &Ast<'_>, blocks: Option<u32>) -> bool {
+    let mut cur = blocks;
+    let mut last_is_list = false;
+    while let Some(b) = cur {
+        let node = &ast.blocks[b as usize];
+        last_is_list = matches!(node.kind, BlockKind::List { .. });
+        cur = node.next;
+    }
+    last_is_list
+}
+
+/// A tight list item renders inline only for these shapes: a single
+/// paragraph; a paragraph then one or more nested lists; or a single
+/// non-paragraph block (e.g. a pipe-table). Anything else (paragraph then a
+/// non-list block, multiple paragraphs) has no inline form here.
+fn tight_item_shape_ok(ast: &Ast<'_>, blocks: Option<u32>) -> bool {
+    let Some(head) = blocks else {
+        return true; // empty item
+    };
+    let mut cur = Some(head);
+    let mut first = true;
+    let mut first_is_para = false;
+    while let Some(b) = cur {
+        let node = &ast.blocks[b as usize];
+        match (&node.kind, first) {
+            (BlockKind::Para(_), true) => first_is_para = true,
+            (BlockKind::List { .. }, false) if first_is_para => {}
+            (_, true) => {
+                // A single non-paragraph block is fine only if it's alone.
+                return node.next.is_none();
+            }
+            _ => return false,
+        }
+        first = false;
+        cur = node.next;
+    }
+    true
 }
 
 /// Append an already-built span chain (head index `head`, or `None`) to
@@ -1979,37 +1915,6 @@ fn chain_extend_spans(ast: &mut Ast<'_>, chain: &mut Chain, head: Option<u32>) {
     chain.last = Some(tail);
 }
 
-/// Whether the top-level span chain `head` carries an inline delimiter the
-/// per-line parse couldn't pair within its own physical line: a bare `*` or
-/// backtick in a Text node, or an unbalanced `[`/`]` count (a link whose
-/// brackets straddle the line break). In a multi-line list item such a
-/// delimiter pairs with one on another line under kramdown's
-/// join-then-parse, which our zero-copy per-line parse can't reproduce (the
-/// joined text would need an owned buffer outliving the `&'a src` borrow),
-/// so the item declines.
-///
-/// `_` is deliberately excluded — intra-word underscores (`runtime_deps`)
-/// are literal in both engines and would over-decline. Balanced brackets
-/// (`arr[0]`, an unresolved `[note]`) stay literal in both engines, so only
-/// an imbalance — the genuine cross-line-link signal — trips this.
-fn chain_has_bare_marker(ast: &Ast<'_>, head: Option<u32>) -> bool {
-    let mut cur = head;
-    let mut bracket_depth: i32 = 0;
-    while let Some(idx) = cur {
-        if let SpanKind::Text(t) = &ast.spans[idx as usize].kind {
-            for b in t.bytes() {
-                match b {
-                    b'*' | b'`' => return true,
-                    b'[' => bracket_depth += 1,
-                    b']' => bracket_depth -= 1,
-                    _ => {}
-                }
-            }
-        }
-        cur = ast.spans[idx as usize].next;
-    }
-    bracket_depth != 0
-}
 
 fn list_marker(line: &str) -> Option<bool> {
     let b = line.as_bytes();

@@ -129,7 +129,9 @@ fn convert_blocks(
                 loose,
                 items,
             } => {
-                emit_list(out, ast, *items, *ordered, *loose, &block.ial, indent, hl);
+                emit_list(
+                    out, ast, *items, *ordered, *loose, &block.ial, indent, opts, hl, used_ids,
+                );
             }
             BlockKind::Quote(inner) => {
                 push_pad(out, indent);
@@ -294,15 +296,16 @@ fn emit_table_row(
     out.push_str("</tr>\n");
 }
 
-/// kramdown's tight-list emission: leaf items are single-line
-/// (`{pad}<li>text</li>`); an item with a nested child opens
-/// across lines with the child <ul>/<ol> indented one level
-/// deeper and `</li>` back at the item's own column:
+/// kramdown's list emission. A TIGHT item renders inline:
+///   {pad}<li>text</li>
+/// or, for a paragraph followed by a nested list, across lines with the child
+/// indented one level deeper and `</li>` back at the item's column:
 ///   {pad}<li>a
-///   {pad+2}<ul>
-///   {pad+4}<li>b</li>
-///   {pad+2}</ul>
+///   {pad+2}<ul> … {pad+2}</ul>
 ///   {pad}</li>
+/// A LOOSE item (or a tight item whose content is a non-paragraph block — a
+/// pipe-table, code) renders in block form, its content blocks recursively
+/// converted at `indent + 4` (paragraphs become `<p>` only when loose).
 #[allow(clippy::too_many_arguments)]
 fn emit_list(
     out: &mut String,
@@ -312,7 +315,9 @@ fn emit_list(
     loose: bool,
     ial: &[(Cow<'_, str>, String)],
     indent: usize,
+    opts: &Options,
     hl: &mut dyn CodeHighlighter,
+    used_ids: &mut HashMap<String, u32>,
 ) {
     let tag = if ordered { "ol" } else { "ul" };
     push_pad(out, indent);
@@ -324,50 +329,39 @@ fn emit_list(
     while let Some(idx) = cur {
         let item = &ast.items[idx as usize];
         cur = item.next;
-        if let Some(bidx) = item.block {
-            // kramdown renders a list item holding a block-level element (here
-            // a pipe-table built from a `|`-bearing item line) in block form:
-            // `<li>` on its own line, the table one level deeper, `</li>` back
-            // at the item column.
+        // A tight item that is a leading paragraph (optionally followed by
+        // nested lists) renders inline; everything else renders in block form.
+        let para = (!loose)
+            .then(|| match item.blocks {
+                Some(h) => match &ast.blocks[h as usize].kind {
+                    BlockKind::Para(spans) => Some((*spans, ast.blocks[h as usize].next)),
+                    _ => None,
+                },
+                None => None,
+            })
+            .flatten();
+        if let Some((spans, rest)) = para {
             push_pad(out, indent + 2);
-            out.push_str("<li>\n");
-            if let BlockKind::Table {
-                aligns,
-                header,
-                body,
-            } = &ast.blocks[bidx as usize].kind
-            {
-                emit_table(out, ast, aligns, header, body, indent + 4, hl);
-            }
-            push_pad(out, indent + 2);
-            out.push_str("</li>\n");
-            continue;
-        }
-        if loose {
-            // kramdown wraps each loose item's content in a `<p>`; loose
-            // lists in the v1 subset never carry a nested child.
-            push_pad(out, indent + 2);
-            out.push_str("<li>\n");
-            push_pad(out, indent + 4);
-            out.push_str("<p>");
-            convert_spans(out, ast, item.spans, hl.codespan_class());
-            out.push_str("</p>\n");
-            push_pad(out, indent + 2);
-            out.push_str("</li>\n");
-            continue;
-        }
-        push_pad(out, indent + 2);
-        out.push_str("<li>");
-        convert_spans(out, ast, item.spans, hl.codespan_class());
-        match &item.child {
-            Some((c_ord, c_items)) => {
+            out.push_str("<li>");
+            convert_spans(out, ast, spans, hl.codespan_class());
+            if rest.is_some() {
                 out.push('\n');
-                emit_list(out, ast, *c_items, *c_ord, false, &[], indent + 4, hl);
+                convert_blocks(out, ast, rest, indent + 4, opts, hl, used_ids);
                 push_pad(out, indent + 2);
-                out.push_str("</li>\n");
             }
-            None => out.push_str("</li>\n"),
+            out.push_str("</li>\n");
+            continue;
         }
+        // Block form: `<li>` on its own line, content one level deeper.
+        push_pad(out, indent + 2);
+        if item.blocks.is_none() {
+            out.push_str("<li></li>\n"); // empty item
+            continue;
+        }
+        out.push_str("<li>\n");
+        convert_blocks(out, ast, item.blocks, indent + 4, opts, hl, used_ids);
+        push_pad(out, indent + 2);
+        out.push_str("</li>\n");
     }
     push_pad(out, indent);
     out.push_str("</");

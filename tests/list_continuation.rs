@@ -163,19 +163,32 @@ fn opt_space_list_interrupts_paragraph() {
 }
 
 #[test]
-fn declines_emphasis_spanning_a_continuation() {
+fn emphasis_spanning_a_continuation() {
     // kramdown joins an item's lines, then parses inline — so `*` opening on
-    // one physical line pairs with `*` on the next. Our zero-copy parse runs
-    // per line and would leave both literal, so we decline. (Balanced inline
-    // markup within a single continuation line is still fine — see
-    // `continuation_keeps_inline_markup`.)
-    declined("- a *open\n  close* b\n");
-    declined("- a **strong\n  across** b\n");
+    // one physical line pairs with `*` on the next. The recursive item parse
+    // now joins the lines before span parsing, matching that exactly.
+    ok(
+        "- a *open\n  close* b\n",
+        "<ul>\n  <li>a <em>open\nclose</em> b</li>\n</ul>\n",
+    );
+    ok(
+        "- a **strong\n  across** b\n",
+        "<ul>\n  <li>a <strong>strong\nacross</strong> b</li>\n</ul>\n",
+    );
     // Bare marker on the marker line, closer on the continuation.
-    declined("- start *here\n  there*\n");
+    ok(
+        "- start *here\n  there*\n",
+        "<ul>\n  <li>start <em>here\nthere</em></li>\n</ul>\n",
+    );
     // An inline link whose brackets straddle the line break.
-    declined("- see [the\n  docs](http://x)\n");
-    declined("1. accurately [set the timezone\n   codes](/win)\n");
+    ok(
+        "- see [the\n  docs](http://x)\n",
+        "<ul>\n  <li>see <a href=\"http://x\">the\ndocs</a></li>\n</ul>\n",
+    );
+    ok(
+        "1. accurately [set the timezone\n   codes](/win)\n",
+        "<ol>\n  <li>accurately <a href=\"/win\">set the timezone\ncodes</a></li>\n</ol>\n",
+    );
 }
 
 #[test]
@@ -194,6 +207,15 @@ fn declines_irregular_indentation() {
     declined("- a\n b\n");
     // Tab indentation.
     declined("- a\n\tb\n");
-    // Trailing whitespace on an item line carries a hard break.
-    declined("- a  \n  b\n");
+}
+
+#[test]
+fn trailing_whitespace_across_a_continuation_is_a_hard_break() {
+    // 2+ trailing spaces on a non-last item line break to the next line — the
+    // recursive item parse runs the paragraph hard-break logic, matching
+    // kramdown's `<br />`.
+    ok(
+        "- a  \n  b\n",
+        "<ul>\n  <li>a<br />\nb</li>\n</ul>\n",
+    );
 }

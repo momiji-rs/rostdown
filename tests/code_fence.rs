@@ -19,6 +19,14 @@ fn ok(src: &str, expected: &str) {
     }
 }
 
+#[track_caller]
+fn declined(src: &str) {
+    match render(src) {
+        Ok(html) => panic!("expected decline for {src:?}, got {html:?}"),
+        Err(Error::Declined(_)) => {}
+    }
+}
+
 #[test]
 fn three_closes_three() {
     ok(

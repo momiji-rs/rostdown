@@ -115,12 +115,24 @@ fn ordered_parent_nested_child() {
 
 #[test]
 fn conservative_declines_hold() {
-    // Blank-separated nesting is LOOSE (`<li><p>` form) — declined.
-    declined("- a\n\n  - b\n");
     // Tab indentation — declined.
     declined("- a\n\t- b\n");
     // 1-space indent is a SAME-level item in kramdown — declined.
     declined("- a\n - b\n");
-    // Column-0 text after a child would join the parent — declined.
-    declined("- a\n  - b\ncont\n");
+}
+
+#[test]
+fn loose_nesting_and_lazy_join_to_deepest_item() {
+    // Blank-separated nesting is LOOSE — the parent's text wraps in `<p>` and
+    // the child list follows after a blank line.
+    ok(
+        "- a\n\n  - b\n",
+        "<ul>\n  <li>\n    <p>a</p>\n\n    <ul>\n      <li>b</li>\n    </ul>\n  </li>\n</ul>\n",
+    );
+    // A column-0 lazy line after a nested child joins the DEEPEST open item
+    // (kramdown's aggressive lazy continuation), not the parent or a new block.
+    ok(
+        "- a\n  - b\ncont\n",
+        "<ul>\n  <li>a\n    <ul>\n      <li>b\ncont</li>\n    </ul>\n  </li>\n</ul>\n",
+    );
 }

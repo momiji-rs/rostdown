@@ -69,11 +69,23 @@ fn quirky_tables_decline() {
     // kramdown tables these, but outside our clean shape — decline (safe):
     declined("a | b | c\nd | e\n"); // ragged (rows differ in cell count)
     declined("> quote | pipe\n"); // pipe inside a blockquote → <blockquote><table>
-    // A multi-line item (lazy/indented continuation) with a pipe — kramdown
-    // only tables an item whose every line is a row, so this stays out of
-    // subset.
-    declined("* a | b\n{% endfor %}\n"); // lead-0 lazy continuation, no pipe
-    declined("* a | b\n  cont | row\n"); // indented continuation
+}
+
+#[test]
+fn multiline_pipe_list_item() {
+    // An item whose continuation lines are ALSO pipe-rows builds a multi-row
+    // table inside the `<li>` (the recursive item parse runs the table builder
+    // over all the item's lines).
+    ok(
+        "* a | b\n  cont | row\n",
+        "<ul>\n  <li>\n    <table>\n      <tbody>\n        <tr>\n          <td>a</td>\n          <td>b</td>\n        </tr>\n        <tr>\n          <td>cont</td>\n          <td>row</td>\n        </tr>\n      </tbody>\n    </table>\n  </li>\n</ul>\n",
+    );
+    // A lazy continuation with NO pipe makes the item's block a plain
+    // paragraph (not every line is a row), pipes kept literal.
+    ok(
+        "* a | b\n{% endfor %}\n",
+        "<ul>\n  <li>a | b\n{% endfor %}</li>\n</ul>\n",
+    );
 }
 
 #[test]
