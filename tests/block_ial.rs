@@ -100,11 +100,34 @@ fn ial_between_items_splits_the_list() {
 // ---- Frontier: still declined ---------------------------------------------
 
 #[test]
+fn leading_ial_attaches_to_following_block() {
+    // kramdown allows a block IAL on EITHER side: `{:.x}` directly BEFORE a
+    // block attaches to it (the Jekyll docs "note" idiom puts it first).
+    ok(
+        "{:.note .info}\nIf you see a warning here.\n",
+        "<p class=\"note info\">If you see a warning here.</p>\n",
+    );
+    ok("{: #custom}\n## Heading\n", "<h2 id=\"custom\">Heading</h2>\n");
+    ok(
+        "{:.x}\n> quote\n",
+        "<blockquote class=\"x\">\n  <p>quote</p>\n</blockquote>\n",
+    );
+    ok(
+        "{:.x}\n- a\n- b\n",
+        "<ul class=\"x\">\n  <li>a</li>\n  <li>b</li>\n</ul>\n",
+    );
+}
+
+#[test]
 fn standalone_ial_declines() {
     // No preceding block to attach to.
     declined("{:.x}\n");
     // Separated from its block by a blank — orphaned, out of subset.
     declined("text\n\n{:.x}\n");
+    // A leading IAL orphaned by a following blank, or before a code fence
+    // (where the attribute renders on `<pre>`, out of subset), declines.
+    declined("{:.x}\n\ntext\n");
+    declined("{:.x}\n```\ncode\n```\n");
 }
 
 #[test]

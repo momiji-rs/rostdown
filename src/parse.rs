@@ -498,9 +498,23 @@ fn parse_blocks<'a>(
 ) -> Result<Option<u32>, Error> {
     let mut chain = Chain::new();
     // Push `kind` into the block arena and link it as the next sibling.
+    // A leading block IAL (`{:.note}` on its own line directly BEFORE its
+    // block) is buffered here and applied to the next attachable block.
+    let mut pending_ial: Vec<(Cow<'a, str>, String)> = Vec::new();
     macro_rules! emit_block {
         ($kind:expr) => {{
             let idx = ast.push_block($kind);
+            if !pending_ial.is_empty()
+                && matches!(
+                    ast.blocks[idx as usize].kind,
+                    BlockKind::Para(_)
+                        | BlockKind::Heading { .. }
+                        | BlockKind::List { .. }
+                        | BlockKind::Quote(_)
+                )
+            {
+                ast.blocks[idx as usize].ial = std::mem::take(&mut pending_ial);
+            }
             chain.link(idx, |p, n| ast.blocks[p as usize].next = Some(n));
         }};
     }
@@ -527,20 +541,34 @@ fn parse_blocks<'a>(
         {
             let t = line.trim_matches([' ', '\t']);
             if let Some(inner) = t.strip_prefix("{:").and_then(|s| s.strip_suffix('}'))
-                && let Some(last) = chain.last
-                && matches!(
-                    ast.blocks[last as usize].kind,
-                    BlockKind::Para(_)
-                        | BlockKind::Heading { .. }
-                        | BlockKind::List { .. }
-                        | BlockKind::Quote(_)
-                )
-                && ast.blocks[last as usize].ial.is_empty()
                 && let Some(attrs) = parse_ial(inner)
             {
-                ast.blocks[last as usize].ial = attrs;
-                i += 1;
-                continue;
+                // Trailing form: `block\n{:.x}` attaches to the PRECEDING
+                // block.
+                if let Some(last) = chain.last
+                    && matches!(
+                        ast.blocks[last as usize].kind,
+                        BlockKind::Para(_)
+                            | BlockKind::Heading { .. }
+                            | BlockKind::List { .. }
+                            | BlockKind::Quote(_)
+                    )
+                    && ast.blocks[last as usize].ial.is_empty()
+                {
+                    ast.blocks[last as usize].ial = attrs;
+                    i += 1;
+                    continue;
+                }
+                // Leading form: `{:.x}\nblock` attaches to the FOLLOWING
+                // block (kramdown allows a block IAL on either side). Buffer
+                // it; `emit_block!` applies it to the next attachable block.
+                if pending_ial.is_empty()
+                    && line_starts_attachable_block(lines, i + 1, opts)
+                {
+                    pending_ial = attrs;
+                    i += 1;
+                    continue;
+                }
             }
         }
 
@@ -1346,6 +1374,35 @@ fn has_table_pipe(t: &str) -> bool {
         }
     }
     false
+}
+
+/// Whether `lines[idx]` begins a block that a LEADING IAL (`{:.x}` on the
+/// line before it) can attach to: a paragraph, heading, blockquote, or
+/// list. Returns false for a blank, another IAL, a fence, indented code, an
+/// HR, an HTML block, or a table — those either orphan the IAL or render the
+/// attribute somewhere we don't model, so the caller declines instead.
+fn line_starts_attachable_block(lines: &[&str], idx: usize, opts: &Options) -> bool {
+    let Some(&l) = lines.get(idx) else {
+        return false;
+    };
+    if is_blank(l)
+        || l.as_bytes().starts_with(b"    ")
+        || l.as_bytes().first() == Some(&b'\t')
+    {
+        return false;
+    }
+    let t = trim_start_ws(l);
+    if t.starts_with("{:")
+        || t.starts_with("```")
+        || t.starts_with("~~~")
+        || is_hr(l)
+        || crate::html_block::starts_html_block(l)
+        || (has_table_pipe(t) && block_all_pipe(lines, idx, opts))
+    {
+        return false;
+    }
+    // Heading / blockquote / list marker / plain paragraph — all attachable.
+    true
 }
 
 /// Whether EVERY line of the block starting at `start` (until a blank line
