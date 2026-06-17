@@ -124,10 +124,22 @@ fn standalone_ial_declines() {
     declined("{:.x}\n");
     // Separated from its block by a blank — orphaned, out of subset.
     declined("text\n\n{:.x}\n");
-    // A leading IAL orphaned by a following blank, or before a code fence
-    // (where the attribute renders on `<pre>`, out of subset), declines.
+    // A leading IAL orphaned by a following blank declines.
     declined("{:.x}\n\ntext\n");
-    declined("{:.x}\n```\ncode\n```\n");
+}
+
+#[test]
+fn leading_ial_attaches_to_a_fence() {
+    // A block IAL directly above a fenced code block lands on `<pre>`; the
+    // language class stays on `<code>`.
+    ok(
+        "{:.x}\n```\ncode\n```\n",
+        "<pre class=\"x\"><code>code\n</code></pre>\n",
+    );
+    ok(
+        "{:.minimal-line-height}\n```shell\nls\n```\n",
+        "<pre class=\"minimal-line-height\"><code class=\"language-shell\">ls\n</code></pre>\n",
+    );
 }
 
 #[test]
@@ -156,5 +168,20 @@ fn leading_ial_attaches_to_a_table() {
     ok(
         "{: .note}\nx | y\n",
         "<table class=\"note\">\n  <tbody>\n    <tr>\n      <td>x</td>\n      <td>y</td>\n    </tr>\n  </tbody>\n</table>\n",
+    );
+}
+
+#[test]
+fn trailing_ial_attaches_to_fence_and_table() {
+    // A block IAL directly below a fenced code block lands on `<pre>`.
+    ok(
+        "```\ncode\n```\n{:.x}\n",
+        "<pre class=\"x\"><code>code\n</code></pre>\n",
+    );
+    // Below a pipe-table it lands on `<table>` (try_parse_table stops at the
+    // IAL line, so the rows above form the table).
+    ok(
+        "a | b\n{:.note}\n",
+        "<table class=\"note\">\n  <tbody>\n    <tr>\n      <td>a</td>\n      <td>b</td>\n    </tr>\n  </tbody>\n</table>\n",
     );
 }

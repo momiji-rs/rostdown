@@ -168,7 +168,11 @@ fn convert_blocks(
                     out.push_str("</div>\n");
                 } else {
                     push_pad(out, indent);
-                    out.push_str("<pre><code");
+                    // A leading block IAL (`{:.x}` directly above the fence)
+                    // lands on `<pre>`; the language class stays on `<code>`.
+                    out.push_str("<pre");
+                    emit_attrs(out, &block.ial);
+                    out.push_str("><code");
                     if let Some(lang) = lang {
                         out.push_str(" class=\"language-");
                         out.push_str(lang);

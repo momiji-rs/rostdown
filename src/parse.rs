@@ -516,6 +516,7 @@ fn parse_blocks<'a>(
                         | BlockKind::List { .. }
                         | BlockKind::Quote(_)
                         | BlockKind::Table { .. }
+                        | BlockKind::Code { .. }
                 )
             {
                 ast.blocks[idx as usize].ial = std::mem::take(&mut pending_ial);
@@ -549,7 +550,9 @@ fn parse_blocks<'a>(
                 && let Some(attrs) = parse_ial(inner)
             {
                 // Trailing form: `block\n{:.x}` attaches to the PRECEDING
-                // block.
+                // block — paragraph, heading, list, blockquote, fenced code
+                // (`<pre>`), or table (`try_parse_table` stops at the IAL line,
+                // so the rows above already formed the table).
                 if let Some(last) = chain.last
                     && matches!(
                         ast.blocks[last as usize].kind,
@@ -557,6 +560,8 @@ fn parse_blocks<'a>(
                             | BlockKind::Heading { .. }
                             | BlockKind::List { .. }
                             | BlockKind::Quote(_)
+                            | BlockKind::Code { .. }
+                            | BlockKind::Table { .. }
                     )
                     && ast.blocks[last as usize].ial.is_empty()
                 {
@@ -1381,6 +1386,12 @@ fn try_parse_table<'a>(
         if trim_start_ws(l).starts_with('+') {
             return Ok(None); // multi-body separator — out of subset
         }
+        // A trailing block IAL (`{:.x}`) ends the table cleanly — it is not a
+        // row but an attribute list for the table the rows already form.
+        let ts = trim_start_ws(l);
+        if ts.starts_with("{:") && !ts.starts_with("{::") && l.len() - ts.len() <= 3 {
+            break;
+        }
         let is_sep = is_table_sep_line(l);
         // A non-separator line with no top-level pipe isn't a table row, so
         // the block is a paragraph, not a table. (A `<` in a cell is fine —
@@ -1539,17 +1550,13 @@ fn line_starts_attachable_block(lines: &[&str], idx: usize) -> bool {
         return false;
     }
     let t = trim_start_ws(l);
-    if t.starts_with("{:")
-        || t.starts_with("```")
-        || t.starts_with("~~~")
-        || is_hr(l)
-        || crate::html_block::starts_html_block(l)
-    {
+    if t.starts_with("{:") || is_hr(l) || crate::html_block::starts_html_block(l) {
         return false;
     }
     // Heading / blockquote / list marker / plain paragraph — all attachable.
-    // A pipe line is attachable too: it becomes a `<table>` (or a paragraph if
-    // not a clean table) and `emit_block!` carries the IAL onto either.
+    // A pipe line is attachable too (becomes a `<table>`, or a paragraph if not
+    // a clean table); a fence is attachable (the IAL lands on `<pre>`).
+    // `emit_block!` carries the pending IAL onto whichever block emits.
     true
 }
 
