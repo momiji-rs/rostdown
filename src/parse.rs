@@ -527,7 +527,10 @@ fn parse_blocks<'a>(
                 && let Some(last) = chain.last
                 && matches!(
                     ast.blocks[last as usize].kind,
-                    BlockKind::Para(_) | BlockKind::Heading { .. } | BlockKind::List { .. }
+                    BlockKind::Para(_)
+                        | BlockKind::Heading { .. }
+                        | BlockKind::List { .. }
+                        | BlockKind::Quote(_)
                 )
                 && ast.blocks[last as usize].ial.is_empty()
                 && let Some(attrs) = parse_ial(inner)
@@ -735,11 +738,11 @@ fn parse_blocks<'a>(
                     i += 1;
                 } else if !is_blank(l) && !inner.is_empty() {
                     // A block-IAL line (`{:…}`) is NOT a lazy continuation:
-                    // it ends the quote and, in kramdown, attaches to the
-                    // `<blockquote>` itself. We don't model blockquote IALs,
-                    // so break and let the top-level scan decline it rather
-                    // than absorb it into the quote body (where it would
-                    // mis-attach to the inner paragraph).
+                    // it ends the quote and attaches to the `<blockquote>`
+                    // itself (kramdown's "note box" idiom `> …\n{:.note}`).
+                    // Break so the top-level scan attaches it to the emitted
+                    // Quote block — NOT absorb it into the quote body, where
+                    // it would mis-attach to the inner paragraph.
                     let t = l.trim_start_matches(' ');
                     if t.starts_with("{:") && !t.starts_with("{::") {
                         break;

@@ -133,7 +133,9 @@ fn convert_blocks(
             }
             BlockKind::Quote(inner) => {
                 push_pad(out, indent);
-                out.push_str("<blockquote>\n");
+                out.push_str("<blockquote");
+                emit_attrs(out, &block.ial);
+                out.push_str(">\n");
                 convert_blocks(out, ast, *inner, indent + 2, opts, hl, used_ids);
                 push_pad(out, indent);
                 out.push_str("</blockquote>\n");
