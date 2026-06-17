@@ -106,3 +106,13 @@ fn standalone_ial_declines() {
     // Separated from its block by a blank — orphaned, out of subset.
     declined("text\n\n{:.x}\n");
 }
+
+#[test]
+fn quote_ial_declines() {
+    // kramdown attaches `{:…}` after a blockquote to the `<blockquote>`;
+    // we don't model that, and must NOT absorb the IAL as a lazy
+    // continuation of the quote (which would mis-attach it to the inner
+    // paragraph) — so the document declines.
+    declined("> quoted\n{:.q}\n");
+    declined("> quoted\n{: style=\"text-align:center\"}\n");
+}

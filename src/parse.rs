@@ -716,6 +716,16 @@ fn parse_blocks<'a>(
                     inner.push(rest.strip_prefix(' ').unwrap_or(rest));
                     i += 1;
                 } else if !is_blank(l) && !inner.is_empty() {
+                    // A block-IAL line (`{:…}`) is NOT a lazy continuation:
+                    // it ends the quote and, in kramdown, attaches to the
+                    // `<blockquote>` itself. We don't model blockquote IALs,
+                    // so break and let the top-level scan decline it rather
+                    // than absorb it into the quote body (where it would
+                    // mis-attach to the inner paragraph).
+                    let t = l.trim_start_matches(' ');
+                    if t.starts_with("{:") && !t.starts_with("{::") {
+                        break;
+                    }
                     // Lazy continuation of the quoted paragraph.
                     inner.push(l);
                     i += 1;
