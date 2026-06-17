@@ -563,6 +563,18 @@ fn parse_blocks<'a>(
                 // kramdown strips optional trailing hashes.
                 let text = trim_end_ws(text);
                 let text = trim_end_ws(text.trim_end_matches('#'));
+                // A trailing `{#id}` / `{:…}` is kramdown's header-id /
+                // header-IAL shorthand: stripped from the text and applied
+                // as the heading's id/attributes. We don't model it, so
+                // decline rather than render the braces literally and slug a
+                // wrong id (e.g. `## With rbenv {#rbenv}` → id="rbenv", not
+                // "with-rbenv-rbenv").
+                if text.ends_with('}')
+                    && let Some(open) = text.rfind('{')
+                    && (text[open..].starts_with("{#") || text[open..].starts_with("{:"))
+                {
+                    return Err(declined("header-ial"));
+                }
                 let spans = parse_spans(ast, text)?;
                 // span_text is the concatenation of child-span texts.
                 // The overwhelmingly common heading is plain prose — a

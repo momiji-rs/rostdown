@@ -72,3 +72,16 @@ fn unclassified_letters_still_decline() {
     // kramdown keeps; we decline rather than guess.
     declined("## Done \u{2705}\u{FE0F}\n");
 }
+
+#[test]
+fn trailing_header_ial_declines() {
+    // kramdown's header-id / header-IAL shorthand: a trailing `{#id}` or
+    // `{:…}` is stripped and applied as the heading's id/attributes. We
+    // don't model it, so decline rather than slug a wrong id.
+    declined("### With rbenv {#rbenv}\n");
+    declined("## Title {:.note}\n");
+    // But braces NOT in trailing-attribute position stay literal text and
+    // render identically — these must still accept.
+    id_is("### Set {x} to value\n", "set-x-to-value");
+    id_is("## Mid {#id} text here\n", "mid-id-text-here");
+}
