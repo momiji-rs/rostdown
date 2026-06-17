@@ -964,7 +964,11 @@ fn try_parse_table<'a>(
             return Ok(None); // multi-body separator — out of subset
         }
         let is_sep = is_table_sep_line(l);
-        if !is_sep && (split_table_cells(l).is_none() || l.contains('<')) {
+        // A non-separator line with no top-level pipe isn't a table row, so
+        // the block is a paragraph, not a table. (A `<` in a cell is fine —
+        // the span parser renders `<=>` literally and declines only real
+        // inline HTML / autolinks, keeping output right-or-declined.)
+        if !is_sep && split_table_cells(l).is_none() {
             return Ok(None);
         }
         end += 1;
@@ -1022,26 +1026,62 @@ fn try_parse_table<'a>(
     )))
 }
 
+/// Does `t` hold an unescaped `|` that is NOT inside a balanced backtick
+/// code span? Such a pipe is kramdown's table trigger; a `|` inside
+/// `` `…` `` is literal. Byte-scanned (`\``|`/backtick are ASCII; a
+/// multibyte char's bytes are all ≥ 0x80, so they just advance). An
+/// unbalanced code span offers no protection — pipes around it still count.
+fn has_table_pipe(t: &str) -> bool {
+    let b = t.as_bytes();
+    let mut i = 0;
+    let mut esc = false;
+    while i < b.len() {
+        if esc {
+            esc = false;
+            i += 1;
+            continue;
+        }
+        match b[i] {
+            b'\\' => {
+                esc = true;
+                i += 1;
+            }
+            b'`' => {
+                let run = run_len(b, i, b'`');
+                let mut j = i + run;
+                let mut closed = false;
+                while j < b.len() {
+                    if b[j] == b'`' {
+                        let r2 = run_len(b, j, b'`');
+                        if r2 == run {
+                            j += run;
+                            closed = true;
+                            break;
+                        }
+                        j += r2;
+                    } else {
+                        j += 1;
+                    }
+                }
+                i = if closed { j } else { i + run };
+            }
+            b'|' => return true,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 fn decline_block_scan(line: &str) -> Result<(), Error> {
     if line.as_bytes().starts_with(b"    ") || line.as_bytes().first() == Some(&b'\t') {
         return Err(declined("indented-code"));
     }
     let t = trim_start_ws(line);
-    // kramdown starts a table on lines containing an unescaped `|`.
-    // Scan bytes (no UTF-8 decode): `\` and `|` are ASCII and a
-    // multibyte char's bytes are all >= 0x80, so each just resets `esc`
-    // — byte-identical to the per-char escape toggle. Most lines have no
-    // `|` at all, so a single tight `contains` skips the escape loop.
-    let tb = t.as_bytes();
-    if crate::scan::memchr1(tb, b'|').is_some() {
-        let mut esc = false;
-        for &b in tb {
-            match b {
-                b'\\' => esc = !esc,
-                b'|' if !esc => return Err(declined("table")),
-                _ => esc = false,
-            }
-        }
+    // kramdown starts a table on a line with an unescaped, non-code-span
+    // `|`. A `|` inside a balanced backtick code span (prose mentioning
+    // `arr.each { |x| … }`) is literal, not a table trigger.
+    if has_table_pipe(t) {
+        return Err(declined("table"));
     }
     if t.starts_with("{:") || t.starts_with("{::") {
         return Err(declined("ald-ial-extension"));
@@ -2159,6 +2199,10 @@ mod byte_opt_tests {
         assert_eq!(reason("café | x"), Some("table"));
         assert_eq!(reason(r"café \| x"), None);
         assert_eq!(reason("naïve prose"), None); // multibyte, no pipe
+        // A `|` inside a balanced code span is literal, not a table.
+        assert_eq!(reason("prose `arr.each { |x| x }` here"), None);
+        assert_eq!(reason("`|`"), None); // a lone piped code span
+        assert_eq!(reason("`code` | real"), Some("table")); // top-level pipe
     }
 
     #[test]
