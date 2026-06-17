@@ -622,6 +622,30 @@ fn parse_blocks<'a>(
             continue;
         }
 
+        // A list behind a 1–3-space OPT_SPACE base: kramdown ignores the
+        // small indent. De-indent the run by the base column (the stripped
+        // suffixes still borrow `src`) and parse it as a column-0 list,
+        // then skip the lines it consumed.
+        let base = line.len() - line.trim_start_matches(' ').len();
+        if (1..=3).contains(&base)
+            && let Some(ordered) = list_marker(&line[base..])
+        {
+            let pad = &"   "[..base];
+            let deindented: Vec<&str> = lines[i..]
+                .iter()
+                .map(|l| l.strip_prefix(pad).unwrap_or(l))
+                .collect();
+            let mut k = 0;
+            let (items, loose) = parse_list_items(ast, &deindented, &mut k, ordered)?;
+            emit_block!(BlockKind::List {
+                ordered,
+                loose,
+                items
+            });
+            i += k;
+            continue;
+        }
+
         // kramdown recognizes most block openers behind 1–3 leading
         // spaces (OPT_SPACE); our dispatcher only sees them at column
         // 0, so an indented opener must decline, not become a paragraph.

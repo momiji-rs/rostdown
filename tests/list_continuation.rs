@@ -107,6 +107,19 @@ fn loose_lists() {
 }
 
 #[test]
+fn indented_opt_space_lists() {
+    // kramdown ignores a 1-3-space OPT_SPACE base indent on a list.
+    ok(
+        " * a\n * b\n",
+        "<ul>\n  <li>a</li>\n  <li>b</li>\n</ul>\n",
+    );
+    ok(
+        "  1. x\n  2. y\n",
+        "<ol>\n  <li>x</li>\n  <li>y</li>\n</ol>\n",
+    );
+}
+
+#[test]
 fn declines_mixed_and_multiblock_lists() {
     // Mixing abutting and blank-separated items renders per-item in
     // kramdown (some `<li>x</li>`, some `<li><p>x</p></li>`) — out of subset.
