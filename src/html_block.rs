@@ -349,6 +349,12 @@ impl<'a> Parser<'a> {
                         self.pos += 1;
                         self.skip_ws();
                         let value = self.attr_value()?;
+                        // A newline inside an attribute value is normalized
+                        // to a space by kramdown (`href="a\nb"` → `"a b"`);
+                        // we don't reproduce that, so decline.
+                        if value.contains('\n') {
+                            return None;
+                        }
                         Self::push_escaped_attr(out, value);
                     }
                     out.push('"');
@@ -423,13 +429,111 @@ fn find_close_ci(s: &str, name: &str) -> Option<usize> {
     None
 }
 
-/// Serialize an inline VOID HTML element at the start of `s` (`s[0] == '<'`,
-/// next byte a letter) — `<br>` / `<br/>` → `<br />`, `<img src=x>` →
-/// `<img src="x" />` — returning the serialization and bytes consumed.
-/// `None` if it isn't a clean void-element tag (non-void name, malformed
-/// attributes, `markdown=`, no `>`). Inline NON-void HTML (with markdown
-/// content) is out of this subset and handled (declined) by the caller.
-pub(crate) fn inline_void_at(s: &str) -> Option<(String, usize)> {
+/// Inline (span-level) HTML elements kramdown re-serializes in span context
+/// while parsing markdown inside them.
+fn is_inline(name: &str) -> bool {
+    is_void(name)
+        || is_escaped_raw(name)
+        || matches!(
+            name,
+            "a" | "abbr"
+                | "acronym"
+                | "b"
+                | "bdo"
+                | "big"
+                | "button"
+                | "cite"
+                | "del"
+                | "dfn"
+                | "em"
+                | "i"
+                | "ins"
+                | "label"
+                | "mark"
+                | "q"
+                | "rb"
+                | "rbc"
+                | "rp"
+                | "rt"
+                | "rtc"
+                | "ruby"
+                | "s"
+                | "small"
+                | "span"
+                | "strike"
+                | "strong"
+                | "sub"
+                | "sup"
+                | "time"
+                | "tt"
+                | "u"
+        )
+}
+
+/// One inline HTML element parsed at a `<` in span context.
+pub(crate) enum Inline<'a> {
+    /// Void element (`<br>` → `<br />`): emit `html` verbatim.
+    Void(String),
+    /// Raw-content element (`<code>`/`<kbd>`/…): emit `open`, the HTML-escaped
+    /// `body`, then `close`, all verbatim (no markdown inside).
+    Raw {
+        open: String,
+        body: String,
+        close: String,
+    },
+    /// Normal element: emit `open`, then the markdown-parsed `content`, then
+    /// `close`.
+    Markdown {
+        open: String,
+        content: &'a str,
+        close: String,
+    },
+}
+
+/// Find the matching `</name>` for an inline element whose content starts at
+/// `start`, returning `(content_end, after_close)` byte offsets. Declines
+/// (`None`) on a nested same-name open tag (no depth tracking — conservative)
+/// or a missing close.
+fn find_inline_close(s: &str, start: usize, name: &str) -> Option<(usize, usize)> {
+    let b = s.as_bytes();
+    let mut i = start;
+    while i + 1 < b.len() {
+        if b[i] == b'<' {
+            if b[i + 1] == b'/' {
+                let after = &s[i + 2..];
+                let nend = after
+                    .bytes()
+                    .position(|c| !(c.is_ascii_alphanumeric() || c == b'-'))?;
+                if after[..nend].eq_ignore_ascii_case(name) {
+                    let mut p = i + 2 + nend;
+                    while b.get(p).is_some_and(|c| matches!(c, b' ' | b'\t')) {
+                        p += 1;
+                    }
+                    if b.get(p) == Some(&b'>') {
+                        return Some((i, p + 1));
+                    }
+                }
+            } else if b[i + 1].is_ascii_alphabetic() {
+                let after = &s[i + 1..];
+                let nend = after
+                    .bytes()
+                    .position(|c| !(c.is_ascii_alphanumeric() || c == b'-'))
+                    .unwrap_or(after.len());
+                if after[..nend].eq_ignore_ascii_case(name) {
+                    return None; // nested same-name element — out of subset
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse one inline HTML element at the start of `s` (`s[0] == '<'`, next a
+/// letter), returning the parsed element and bytes consumed. `None` if it
+/// isn't a clean inline element (block-level name, `markdown=`, malformed,
+/// unclosed, self-closed non-void, nested same-name).
+pub(crate) fn inline_at(s: &str) -> Option<(Inline<'_>, usize)> {
     let mut p = Parser {
         b: s.as_bytes(),
         s,
@@ -450,17 +554,33 @@ pub(crate) fn inline_void_at(s: &str) -> Option<(String, usize)> {
         p.pos += 1;
     }
     let name = s[name_start..p.pos].to_ascii_lowercase();
-    if !is_void(&name) {
-        return None;
+    if !is_inline(&name) {
+        return None; // block-level / unknown inline element — out of subset
     }
-    let mut out = String::with_capacity(name.len() + 8);
-    out.push('<');
-    out.push_str(&name);
-    // Serialize/normalize attributes (consumes through the closing `>` or
-    // self-closing `/>`); a void element always re-serializes as ` />`.
-    p.attributes(&mut out)?;
-    out.push_str(" />");
-    Some((out, p.pos))
+    let mut open = String::with_capacity(name.len() + 8);
+    open.push('<');
+    open.push_str(&name);
+    let self_closed = p.attributes(&mut open)?;
+
+    if is_void(&name) {
+        open.push_str(" />");
+        return Some((Inline::Void(open), p.pos));
+    }
+    if self_closed {
+        return None; // self-closed non-void inline element — rare, decline
+    }
+    open.push('>');
+    let close = format!("</{name}>");
+    let content_start = p.pos;
+    let (content_end, after_close) = find_inline_close(s, content_start, &name)?;
+    let content = &s[content_start..content_end];
+
+    if is_escaped_raw(&name) {
+        let mut body = String::new();
+        Parser::push_escaped_text(&mut body, content);
+        return Some((Inline::Raw { open, body, close }, after_close));
+    }
+    Some((Inline::Markdown { open, content, close }, after_close))
 }
 
 /// Serialize one top-level HTML block at the start of `src` (which begins at

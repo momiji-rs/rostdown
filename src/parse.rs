@@ -2243,15 +2243,32 @@ fn parse_spans_until<'a>(
                 // Autolinks / inline HTML are out of subset; a bare `<`
                 // followed by space/punct is plain text.
                 let next = bytes.get(i + 1).copied();
-                // An inline VOID HTML element (`<br>`, `<img …>`, `<wbr>`) is
-                // re-serialized as ` />` to match kramdown. Non-void inline
-                // HTML (markdown-parsed content) stays out of subset.
+                // An inline HTML element is re-serialized to match kramdown:
+                // void → ` />`, raw-content (`<code>`/…) → escaped body, and
+                // a normal element's content is parsed as markdown. Anything
+                // else (block-level inline, autolink, comment) declines.
                 if next.is_some_and(|c| c.is_ascii_alphabetic())
-                    && let Some((html, len)) = crate::html_block::inline_void_at(&text[i..])
+                    && let Some((el, len)) = crate::html_block::inline_at(&text[i..])
                 {
                     acc.flush(ast, &mut chain);
-                    let idx = ast.push_span(SpanKind::Raw(Cow::Owned(html)));
-                    chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
+                    let push_raw = |ast: &mut Ast<'a>, chain: &mut Chain, s: String| {
+                        let idx = ast.push_span(SpanKind::Raw(Cow::Owned(s)));
+                        chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
+                    };
+                    match el {
+                        crate::html_block::Inline::Void(html) => push_raw(ast, &mut chain, html),
+                        crate::html_block::Inline::Raw { open, body, close } => {
+                            push_raw(ast, &mut chain, open);
+                            push_raw(ast, &mut chain, body);
+                            push_raw(ast, &mut chain, close);
+                        }
+                        crate::html_block::Inline::Markdown { open, content, close } => {
+                            push_raw(ast, &mut chain, open);
+                            let inner = parse_spans(ast, content)?;
+                            chain_extend_spans(ast, &mut chain, inner);
+                            push_raw(ast, &mut chain, close);
+                        }
+                    }
                     prev = Some('>');
                     i += len;
                     continue;

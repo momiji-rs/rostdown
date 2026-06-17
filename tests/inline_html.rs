@@ -52,14 +52,42 @@ fn void_inside_emphasis_and_repeated() {
 }
 
 #[test]
-fn non_void_inline_and_autolinks_decline() {
-    // Non-void inline HTML parses markdown inside (out of the void subset).
-    declined("a <span>x</span> b\n");
-    declined("see <a href=\"/x\">link</a>\n");
-    declined("use <abbr title=\"HyperText\">HTML</abbr>\n");
+fn non_void_inline_with_markdown_content() {
+    // A non-void inline element is re-serialized and its content parsed as
+    // markdown (typography included).
+    ok(
+        "see <a href=\"/x\">link text</a> end\n",
+        "<p>see <a href=\"/x\">link text</a> end</p>\n",
+    );
+    ok(
+        "use <abbr title=\"HyperText\">HTML</abbr> ok\n",
+        "<p>use <abbr title=\"HyperText\">HTML</abbr> ok</p>\n",
+    );
+    ok("x <sub>2</sub>O\n", "<p>x <sub>2</sub>O</p>\n");
+    ok(
+        "a <a href=\"/x\">**bold**</a> b\n",
+        "<p>a <a href=\"/x\"><strong>bold</strong></a> b</p>\n",
+    );
+    ok(
+        "q <q>quoted \"x\"</q> e\n",
+        "<p>q <q>quoted \u{201c}x\u{201d}</q> e</p>\n",
+    );
+    // Raw-content inline element: body escaped, no markdown inside.
+    ok(
+        "a <code>x<y & z</code> b\n",
+        "<p>a <code>x&lt;y &amp; z</code> b</p>\n",
+    );
+}
+
+#[test]
+fn inline_html_out_of_subset_declines() {
     // Autolinks.
     declined("see <http://example.com> now\n");
     // Comment / close-without-open.
     declined("a <!-- c --> b\n");
     declined("a </div> b\n");
+    // A nested same-name element (no depth tracking — conservative).
+    declined("a <span>x <span>y</span> z</span> b\n");
+    // An attribute value spanning a line break (kramdown normalizes it).
+    declined("Link: <a href=\"test\nfoo\">x</a>\n");
 }
