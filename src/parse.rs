@@ -1817,6 +1817,11 @@ fn parse_list_items<'a>(
             let mut content: Vec<&'a str> = vec![first];
             *i += 1;
             let mut internal_blank = false;
+            // Once a shallow-indented (< content_col) nested marker is kept
+            // verbatim, a later line at the full content column would be
+            // de-indented on a different basis (kramdown splits the differing
+            // indents into separate lists) — ambiguous, so decline the mix.
+            let mut saw_shallow = false;
             while *i < lines.len() {
                 let cl = lines[*i];
                 if is_blank(cl) {
@@ -1842,6 +1847,9 @@ fn parse_list_items<'a>(
                 }
                 let lead = cl.len() - cl.trim_start_matches(' ').len();
                 if lead >= content_col {
+                    if saw_shallow {
+                        return Err(declined("list-continuation"));
+                    }
                     content.push(&cl[content_col..]);
                     *i += 1;
                 } else if lead == 0 && list_marker(cl) == Some(ordered) {
@@ -1855,13 +1863,24 @@ fn parse_list_items<'a>(
                     // shapes we can't render.
                     content.push(cl);
                     *i += 1;
+                } else if lead == 0 {
+                    break; // a column-0 `{:` block IAL ends the list
+                } else if list_marker(trim_start_ws(cl)) == Some(!ordered) {
+                    // A shallow-indented (1..content_col) marker of the OPPOSITE
+                    // kind is a lazy continuation in kramdown: kept VERBATIM
+                    // (leading spaces intact), then re-parsed as an OPT_SPACE
+                    // nested list (`1. a:\n  * b` → `<li>a:<ul>…`). A same-kind
+                    // shallow marker is a same-level sibling (`- a\n - b` is
+                    // flat) and varying shallow indents split into separate
+                    // lists — both out of subset, so they fall to the decline.
+                    content.push(cl);
+                    saw_shallow = true;
+                    *i += 1;
                 } else {
-                    // A `{:` IAL ends the list (the main loop attaches it); a
-                    // 1..content_col indent (ordered wide markers) is out of
-                    // our clean subset.
-                    if lead == 0 {
-                        break;
-                    }
+                    // A shallow-indented plain line is a lazy paragraph
+                    // continuation whose residual leading space kramdown keeps
+                    // but our flat de-indent can't reproduce; a same-kind
+                    // shallow marker is ambiguous — decline either way.
                     return Err(declined("list-continuation"));
                 }
             }

@@ -151,3 +151,19 @@ fn tight_item_with_block_content() {
         "<ul>\n  <li>a\n    <blockquote>\n      <p>quote</p>\n    </blockquote>\n  </li>\n</ul>\n",
     );
 }
+
+#[test]
+fn ordered_item_with_shallow_indent_nested_ul() {
+    // A nested list indented less than the ordered marker's content column
+    // (`1. ` = column 3, nested `*` at 2) is a lazy continuation kramdown
+    // re-parses as an OPT_SPACE nested list.
+    ok(
+        "1. text:\n  * a\n  * b\n",
+        "<ol>\n  <li>text:\n    <ul>\n      <li>a</li>\n      <li>b</li>\n    </ul>\n  </li>\n</ol>\n",
+    );
+    // A same-kind shallow marker is a same-level sibling, not a nest — out of
+    // subset, declines.
+    declined("- a\n - b\n");
+    // Mixed shallow indents (kramdown splits into separate lists) — declines.
+    declined("1. a\n  * x\n   * y\n");
+}
