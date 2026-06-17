@@ -26,8 +26,3 @@ profiling = []
 simd = []
 
 [dependencies]
-
-# Thin LTO recovers a few percent on the examples/benchmarks; no effect
-# on dev/test builds.
-[profile.release]
-lto = "thin"
