@@ -2075,6 +2075,13 @@ fn parse_spans_until<'a>(
                     && let Some(close_rel) = text[i + 2..].find('}')
                     && let Some(attrs) = parse_ial(&text[i + 2..i + 2 + close_rel])
                 {
+                    // A second IAL abutting the same span (`…{:.a}{:.b}`)
+                    // would need kramdown's cross-IAL attribute merge (class
+                    // accumulation, id override) we don't model — declining
+                    // beats dropping the first or emitting a duplicate attr.
+                    if ast.span_ials.contains_key(&last) {
+                        return Err(declined("chained-span-ial"));
+                    }
                     ast.span_ials.insert(last, attrs);
                     i += 2 + close_rel + 1;
                     continue;
