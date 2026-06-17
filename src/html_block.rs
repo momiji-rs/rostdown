@@ -70,44 +70,16 @@ fn is_decline_raw(name: &str) -> bool {
     )
 }
 
-/// Block-level container elements we accept as the START of a top-level HTML
-/// block (kramdown's block set, restricted to those with a `:block`/`:span`
-/// — not `:raw` — content model, and excluding void/document/markdown-ish
-/// ones). A block opening with anything else declines.
+/// Whether `name` starts a top-level HTML BLOCK — a known block element
+/// (`div`, `figure`, `section`, `p`, `ul`, …) OR an unknown/custom element
+/// (`is-land`, `my-widget`, `sl-button`). kramdown treats both as a
+/// `:block`-content element at a block boundary (content verbatim, markdown
+/// not parsed, nested tags re-serialized) — exactly what [`serialize`]
+/// produces. EXCLUDED: known span/void elements (`<span>`/`<br>` at column 0
+/// are `<p>`-wrapped, out of subset) and raw-text elements (`<table>`,
+/// `<script>`, …, with a different content model).
 fn is_block_start(name: &str) -> bool {
-    matches!(
-        name,
-        "div"
-            | "figure"
-            | "figcaption"
-            | "section"
-            | "article"
-            | "aside"
-            | "header"
-            | "footer"
-            | "nav"
-            | "main"
-            | "hgroup"
-            | "summary"
-            | "p"
-            | "dl"
-            | "dt"
-            | "dd"
-            | "ol"
-            | "ul"
-            | "li"
-            | "form"
-            | "fieldset"
-            | "legend"
-            | "address"
-            | "h1"
-            | "h2"
-            | "h3"
-            | "h4"
-            | "h5"
-            | "h6"
-            | "iframe"
-    )
+    !is_decline_raw(name) && !is_inline(name)
 }
 
 /// Whether `line` (already known to be at a block boundary) begins a

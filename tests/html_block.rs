@@ -90,6 +90,22 @@ fn surrounded_by_paragraphs() {
 }
 
 #[test]
+fn custom_and_unknown_block_elements() {
+    // kramdown treats an unknown / custom element at a block boundary as a
+    // `:block`-content element (content verbatim, markdown not parsed,
+    // nested tags re-serialized) — like a div. Common in modern Bridgetown
+    // (web components).
+    ok(
+        "<is-land on:visible import=\"x\">\n  <breezy-day></breezy-day>\n</is-land>\n",
+        "<is-land on:visible=\"\" import=\"x\">\n  <breezy-day></breezy-day>\n</is-land>\n",
+    );
+    ok(
+        "<my-widget>\nThis has **markdown** inside.\n</my-widget>\n",
+        "<my-widget>\nThis has **markdown** inside.\n</my-widget>\n",
+    );
+}
+
+#[test]
 fn out_of_subset_declines() {
     declined("<table class=\"x\">\n<tr><td>a</td></tr>\n</table>\n"); // table family is :raw
     declined("<!-- a comment -->\n"); // comment
