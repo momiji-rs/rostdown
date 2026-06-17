@@ -474,34 +474,64 @@ fn basic_generate_id(raw: &str) -> String {
     id
 }
 
-/// kramdown-parser-gfm `generate_gfm_header_id`: Unicode downcase,
-/// delete `[^\p{Word}\- \t]`, then ` `/`\t` → `-` (one hyphen EACH, no
-/// collapsing; leading digits are kept, unlike core).
-///
-/// We reproduce it for: ASCII (where `\p{Word}` is `[A-Za-z0-9_]` and
-/// other ASCII gets deleted), the typography characters our parser
-/// emits (punctuation classes — non-Word, deleted), and caseless CJK
-/// ranges (`\p{Word}`, preserved verbatim). Any other non-ASCII
-/// returns `None` and the parser declines the document — Ruby's
-/// Unicode word classes and casing can't be safely approximated.
+/// How a single character maps under kramdown-parser-gfm
+/// `generate_gfm_header_id`: Unicode downcase, delete `[^\p{Word}\- \t]`,
+/// then ` `/`\t` → `-` (one hyphen EACH, no collapsing; leading digits
+/// kept, unlike core). See [`slug_char`] for which chars we classify
+/// exactly versus decline.
+enum SlugChar {
+    /// A `\p{Word}` char (or a space → `-`) that lands in the slug.
+    Keep(char),
+    /// Outside `\p{Word}`, `-`, ` ` — deleted (ASCII punctuation, the
+    /// typography codepoints, and the symbol/emoji blocks below).
+    Drop,
+    /// A char whose `\p{Word}` membership we don't classify exactly (most
+    /// non-ASCII letters/marks) — the caller declines rather than risk a
+    /// wrong id.
+    Unsupported,
+}
+
+/// Classify one char for the GFM slug. Shared by [`gfm_slug`] (which
+/// builds the slug) and [`gfm_slug_ok`] (the parser's non-allocating
+/// validity gate) so the two can never drift.
+fn slug_char(ch: char) -> SlugChar {
+    use SlugChar::{Drop, Keep, Unsupported};
+    match ch {
+        'a'..='z' | '0'..='9' | '_' | '-' => Keep(ch),
+        'A'..='Z' => Keep(ch.to_ascii_lowercase()),
+        ' ' | '\t' => Keep('-'),
+        c if c.is_ascii() => Drop, // ASCII punctuation: non-Word
+        // Typography output (smart quotes, dashes, ellipsis): non-Word.
+        '\u{2018}' | '\u{2019}' | '\u{201C}' | '\u{201D}' | '\u{2013}' | '\u{2014}'
+        | '\u{2026}' => Drop,
+        // Symbol/emoji blocks kramdown's `\p{Word}` excludes — deleted like
+        // ASCII punctuation. Every entry is Symbol-category (no letters,
+        // marks, or digits): Arrows, Misc Technical, Misc Symbols +
+        // Dingbats, Misc Symbols & Arrows, and the emoji/pictograph planes.
+        // A variation selector / ZWJ riding an emoji is itself a `\p{Word}`
+        // mark kramdown keeps; those fall to `Unsupported` below, so an
+        // emoji carrying one declines rather than mis-slug.
+        '\u{2190}'..='\u{21FF}'
+        | '\u{2300}'..='\u{23FF}'
+        | '\u{2600}'..='\u{27BF}'
+        | '\u{2B00}'..='\u{2BFF}'
+        | '\u{1F000}'..='\u{1FAFF}' => Drop,
+        // Caseless `\p{Word}` ranges kept verbatim: CJK, kana, hangul.
+        c @ ('\u{4E00}'..='\u{9FFF}'
+        | '\u{3400}'..='\u{4DBF}'
+        | '\u{3040}'..='\u{30FF}'
+        | '\u{AC00}'..='\u{D7AF}') => Keep(c),
+        _ => Unsupported,
+    }
+}
+
 pub(crate) fn gfm_slug(span_text: &str) -> Option<String> {
     let mut id = String::with_capacity(span_text.len());
     for ch in span_text.chars() {
-        match ch {
-            'a'..='z' | '0'..='9' | '_' | '-' => id.push(ch),
-            'A'..='Z' => id.push(ch.to_ascii_lowercase()),
-            ' ' | '\t' => id.push('-'),
-            c if c.is_ascii() => {} // ASCII punctuation: non-Word, deleted
-            // Typography output (smart quotes, dashes, ellipsis).
-            '\u{2018}' | '\u{2019}' | '\u{201C}' | '\u{201D}' | '\u{2013}' | '\u{2014}'
-            | '\u{2026}' => {}
-            // Caseless \p{Word} ranges passed through verbatim:
-            // CJK ideographs, kana, hangul syllables.
-            c @ ('\u{4E00}'..='\u{9FFF}'
-            | '\u{3400}'..='\u{4DBF}'
-            | '\u{3040}'..='\u{30FF}'
-            | '\u{AC00}'..='\u{D7AF}') => id.push(c),
-            _ => return None,
+        match slug_char(ch) {
+            SlugChar::Keep(c) => id.push(c),
+            SlugChar::Drop => {}
+            SlugChar::Unsupported => return None,
         }
     }
     if id.is_empty() { None } else { Some(id) }
@@ -510,21 +540,15 @@ pub(crate) fn gfm_slug(span_text: &str) -> Option<String> {
 /// Whether [`gfm_slug`] would produce `Some` for `span_text`, WITHOUT
 /// allocating the slug — the parser only needs the yes/no to decide
 /// whether to decline (the converter builds the real slug later). Mirrors
-/// `gfm_slug`'s char classification exactly: reject the same unsupported
-/// non-ASCII chars, and reject an all-deleted (would-be-empty) result.
+/// `gfm_slug`'s classification exactly via [`slug_char`]: reject the same
+/// unsupported chars, and reject an all-deleted (would-be-empty) result.
 pub(crate) fn gfm_slug_ok(span_text: &str) -> bool {
     let mut non_empty = false;
     for ch in span_text.chars() {
-        match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | ' ' | '\t' => non_empty = true,
-            c if c.is_ascii() => {} // ASCII punctuation: deleted
-            '\u{2018}' | '\u{2019}' | '\u{201C}' | '\u{201D}' | '\u{2013}' | '\u{2014}'
-            | '\u{2026}' => {}
-            '\u{4E00}'..='\u{9FFF}'
-            | '\u{3400}'..='\u{4DBF}'
-            | '\u{3040}'..='\u{30FF}'
-            | '\u{AC00}'..='\u{D7AF}' => non_empty = true,
-            _ => return false,
+        match slug_char(ch) {
+            SlugChar::Keep(_) => non_empty = true,
+            SlugChar::Drop => {}
+            SlugChar::Unsupported => return false,
         }
     }
     non_empty
