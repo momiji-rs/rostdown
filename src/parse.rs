@@ -2442,9 +2442,6 @@ fn normalize_ref_id(s: &str) -> String {
     out
 }
 
-/// Parse a link reference definition: `[id]: url`, with `url` bare or in
-/// `<…>`, an optional `"title"` / `'title'` / `(title)`, behind ≤3 spaces.
-/// `None` unless the whole line is a clean single-line definition.
 /// Parse an HTML entity at the start of `s` (`s` begins with `&`), returning
 /// its resolved code point and the byte length consumed (through the `;`).
 /// `None` ⇒ not a recognized entity, so the caller leaves the `&` literal.
@@ -2500,50 +2497,92 @@ fn parse_entity(s: &str) -> Option<(u32, usize)> {
     }
 }
 
+/// A trailing `"…"` / `'…'` title in a link definition: `s` begins with the
+/// quote, and the matching quote must be followed only by whitespace (the
+/// `(?:…(["'])(.+?)\4)?[ \t]*?\n` tail of kramdown's regex). `None` if `s`
+/// isn't a well-formed quoted-to-end title. (`(…)` is NOT a title in a
+/// definition — only inline links allow that — so the bare-dest caller keeps
+/// parens in the destination.)
+fn parse_def_title(s: &str) -> Option<&str> {
+    let b = s.as_bytes();
+    let q = *b.first()?;
+    if q != b'"' && q != b'\'' {
+        return None;
+    }
+    // Non-greedy `.+?`: the first closing quote (content ≥ 1 char) after
+    // which only whitespace remains.
+    let mut j = 2; // content must be at least one byte
+    while j < b.len() {
+        if b[j] == q && s[j + 1..].bytes().all(|c| c == b' ' || c == b'\t') {
+            return Some(&s[1..j]);
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Parse a link reference definition: `[id]: dest`, the destination bare or
+/// in `<…>`, with an optional trailing `"title"` / `'title'`, behind ≤3
+/// spaces. Mirrors kramdown's `LINK_DEFINITION_START` + its post-check:
+/// the bare destination may contain spaces (so an unexpanded Liquid
+/// `{{ … }}` URL parses) but NOT whitespace-then-quote — kramdown rejects
+/// such a line, so we do too. `None` unless the whole line is a clean
+/// single-line definition.
 fn parse_link_def(line: &str) -> Option<(String, &str, Option<&str>)> {
     let lead = line.len() - line.trim_start_matches(' ').len();
     if lead > 3 {
         return None; // ≥4 spaces is indented code, not a definition
     }
     let t = line[lead..].strip_prefix('[')?;
+    // `[^id]:` is a FOOTNOTE definition, not a link definition — leave it
+    // for the footnote path (which declines), don't swallow it here.
+    if t.starts_with('^') {
+        return None;
+    }
     let close = t.find(']')?;
     let id = normalize_ref_id(&t[..close]);
     if id.is_empty() {
         return None;
     }
-    let rest = t[close + 1..].strip_prefix(':')?.trim_start_matches([' ', '\t']);
-    // Destination: `<…>` (angle-bracketed) or bare up to whitespace.
-    let (url, after_url) = if let Some(r) = rest.strip_prefix('<') {
-        let end = r.find('>')?;
-        (&r[..end], &r[end + 1..])
-    } else {
-        match rest.find(char::is_whitespace) {
-            Some(p) => (&rest[..p], &rest[p..]),
-            None => (rest, ""),
-        }
-    };
-    if url.is_empty() {
+    // After `]:`, kramdown's `[ \t]*` eats leading and its `[ \t]*?\n` eats
+    // trailing whitespace, so trim both ends of the run we examine.
+    let rest = t[close + 1..].strip_prefix(':')?.trim_matches([' ', '\t']);
+    if rest.is_empty() {
         return None;
     }
-    // Optional title; anything else after the destination ⇒ not a def.
-    let after = after_url.trim_start_matches([' ', '\t']);
-    let title = if after.is_empty() {
-        None
-    } else {
-        let closer = match after.as_bytes()[0] {
-            b'"' => b'"',
-            b'\'' => b'\'',
-            b'(' => b')',
-            _ => return None,
+
+    if let Some(r) = rest.strip_prefix('<') {
+        // Angle destination `<url>`, optional trailing title.
+        let end = r.find('>')?;
+        let after = r[end + 1..].trim_start_matches([' ', '\t']);
+        let title = if after.is_empty() {
+            None
+        } else {
+            Some(parse_def_title(after)?)
         };
-        let inner = &after[1..];
-        let end = inner.bytes().position(|b| b == closer)?;
-        if !inner[end + 1..].trim_matches([' ', '\t']).is_empty() {
-            return None;
+        return Some((id, &r[..end], title));
+    }
+
+    // Bare destination: spaces allowed. The first whitespace-then-quote
+    // either STARTS a valid trailing title (everything before it is the
+    // destination) or makes the line invalid — kramdown's post-check
+    // `return false if dest =~ /[ \t]+["']/` rejects a destination that
+    // itself contains whitespace-then-quote.
+    let mut q = 1;
+    let bytes = rest.as_bytes();
+    while q < bytes.len() {
+        if (bytes[q] == b'"' || bytes[q] == b'\'') && matches!(bytes[q - 1], b' ' | b'\t') {
+            // Destination is everything before this whitespace run.
+            let dest_end = rest[..q].trim_end_matches([' ', '\t']).len();
+            if dest_end == 0 {
+                return None; // destination needs a non-space char
+            }
+            let title = parse_def_title(&rest[q..])?; // else: not a definition
+            return Some((id, &rest[..dest_end], Some(title)));
         }
-        Some(&inner[..end])
-    };
-    Some((id, url, title))
+        q += 1;
+    }
+    Some((id, rest, None)) // whole line is the destination, no title
 }
 
 /// Whether `line` has the block link-definition SHAPE `[id]:` (≤3-space
@@ -2559,6 +2598,10 @@ fn looks_like_link_def(line: &str) -> bool {
     let Some(t) = line[lead..].strip_prefix('[') else {
         return false;
     };
+    // `[^id]:` is a footnote definition, handled (declined) elsewhere.
+    if t.starts_with('^') {
+        return false;
+    }
     let Some(close) = t.find(']') else {
         return false;
     };
@@ -2898,7 +2941,20 @@ mod byte_opt_tests {
         // SHAPE matches, so the document declines instead of emitting the
         // line as a literal paragraph.
         assert!(looks_like_link_def("[1349]: {{ site.repository }}/issues/1349"));
-        assert_eq!(parse_link_def("[1349]: {{ site.repository }}/issues/1349"), None);
+        // An unexpanded Liquid `{{ … }}` URL has spaces but no whitespace+
+        // quote, so it parses (kramdown's bare destination allows spaces).
+        let (id, url, title) =
+            parse_link_def("[1349]: {{ site.repository }}/issues/1349").unwrap();
+        assert_eq!((id.as_str(), url, title), ("1349", "{{ site.repository }}/issues/1349", None));
+        // A trailing quoted title splits off the destination.
+        assert_eq!(parse_link_def("[a]: dest \"t\""), Some(("a".into(), "dest", Some("t"))));
+        // `(…)` is NOT a title in a definition — it stays in the destination.
+        assert_eq!(parse_link_def("[a]: dest (x)"), Some(("a".into(), "dest (x)", None)));
+        // Whitespace-then-quote inside the would-be destination ⇒ not a def.
+        assert_eq!(parse_link_def("[a]: a b \"t\" extra"), None);
+        // Footnote definitions are not link definitions.
+        assert!(!looks_like_link_def("[^first]: note"));
+        assert_eq!(parse_link_def("[^first]: note"), None);
         // Not definitions: inline link, mid-line, empty id, deep indent.
         assert!(!looks_like_link_def("[text](url)"));
         assert!(!looks_like_link_def("see [id]: later"));
