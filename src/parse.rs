@@ -208,6 +208,8 @@ pub(crate) enum SpanKind<'a> {
     Raw(Cow<'a, str>),
     /// Emphasis: index of the first child span.
     Em(Option<u32>),
+    /// GFM strikethrough (`~~…~~`): index of the first child span.
+    Del(Option<u32>),
     /// Strong: index of the first child span.
     Strong(Option<u32>),
     Code(Cow<'a, str>),
@@ -1078,6 +1080,7 @@ fn copy_spans_owned<'a>(dst: &mut Ast<'a>, scratch: &Ast<'_>, head: Option<u32>)
             SpanKind::Code(t) => SpanKind::Code(Cow::Owned(t.clone().into_owned())),
             SpanKind::Em(inner) => SpanKind::Em(copy_spans_owned(dst, scratch, *inner)),
             SpanKind::Strong(inner) => SpanKind::Strong(copy_spans_owned(dst, scratch, *inner)),
+            SpanKind::Del(inner) => SpanKind::Del(copy_spans_owned(dst, scratch, *inner)),
             SpanKind::Link { spans, href, title } => SpanKind::Link {
                 spans: copy_spans_owned(dst, scratch, *spans),
                 href: Cow::Owned(href.clone().into_owned()),
@@ -1909,6 +1912,7 @@ fn strip_marker(line: &str, ordered: bool) -> &str {
 enum Elem {
     Em,
     Strong,
+    Del,
     Link,
 }
 
@@ -2378,7 +2382,47 @@ fn parse_spans_until<'a>(
                 }
             }
             b'~' if bytes.get(i + 1) == Some(&b'~') => {
-                return Err(declined("strikethrough"));
+                // GFM strikethrough `~~text~~`. Like emphasis: opens unless
+                // the next char is a space; the close (generic stop check)
+                // needs non-empty content not preceded by a space. A run of
+                // 3+ tildes inline is a rarer kramdown form — decline.
+                if run_len(bytes, i, b'~') != 2 {
+                    return Err(declined("strikethrough"));
+                }
+                let opens_on_space = text[i + 2..].chars().next().is_some_and(ruby_space);
+                if parent == Some(Elem::Del) || opens_on_space {
+                    acc.push_verbatim(i, i + 2);
+                    prev = Some('~');
+                    i += 2;
+                    continue;
+                }
+                let attempt = Stop {
+                    type_char: b'~',
+                    delim_len: 2,
+                    elem: Elem::Del,
+                };
+                let saved = ast.spans.len();
+                let (inner, close) = parse_spans_until(
+                    ast,
+                    &text[i + 2..],
+                    Some(&attempt),
+                    in_em,
+                    in_strong,
+                    Some(Elem::Del),
+                )?;
+                if let Some(close) = close {
+                    acc.flush(ast, &mut chain);
+                    let idx = ast.push_span(SpanKind::Del(inner));
+                    chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
+                    prev = Some('~');
+                    i += 2 + close + 2;
+                    continue;
+                }
+                // No close: kramdown reverts to literal `~~`.
+                ast.spans.truncate(saved);
+                acc.push_verbatim(i, i + 2);
+                prev = Some('~');
+                i += 2;
             }
             b'{' if bytes.get(i + 1) == Some(&b':') => {
                 // Span IAL: `{:…}` immediately after a span element (no text
@@ -2663,7 +2707,10 @@ pub(crate) fn spans_raw_text(ast: &Ast<'_>, spans: Option<u32>, out: &mut String
             SpanKind::Raw(_) => {}
             // kramdown's GFM header-id slug ignores an image's alt text.
             SpanKind::Image { .. } => {}
-            SpanKind::Em(inner) | SpanKind::Strong(inner) | SpanKind::Link { spans: inner, .. } => {
+            SpanKind::Em(inner)
+            | SpanKind::Strong(inner)
+            | SpanKind::Del(inner)
+            | SpanKind::Link { spans: inner, .. } => {
                 spans_raw_text(ast, *inner, out);
             }
         }

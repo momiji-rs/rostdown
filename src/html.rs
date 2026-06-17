@@ -365,6 +365,11 @@ fn convert_spans(out: &mut String, ast: &Ast<'_>, head: Option<u32>, codespan_cl
                 convert_spans(out, ast, *inner, codespan_class);
                 out.push_str("</strong>");
             }
+            SpanKind::Del(inner) => {
+                out.push_str("<del>");
+                convert_spans(out, ast, *inner, codespan_class);
+                out.push_str("</del>");
+            }
             SpanKind::Code(code) => {
                 match codespan_class {
                     Some(class) => {
