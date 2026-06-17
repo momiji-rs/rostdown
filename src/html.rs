@@ -196,28 +196,41 @@ fn convert_blocks(
                 aligns,
                 header,
                 body,
-            } => {
-                push_pad(out, indent);
-                out.push_str("<table>\n");
-                if let Some(header) = header {
-                    push_pad(out, indent + 2);
-                    out.push_str("<thead>\n");
-                    emit_table_row(out, ast, header, aligns, true, indent + 4, hl);
-                    push_pad(out, indent + 2);
-                    out.push_str("</thead>\n");
-                }
-                push_pad(out, indent + 2);
-                out.push_str("<tbody>\n");
-                for row in body {
-                    emit_table_row(out, ast, row, aligns, false, indent + 4, hl);
-                }
-                push_pad(out, indent + 2);
-                out.push_str("</tbody>\n");
-                push_pad(out, indent);
-                out.push_str("</table>\n");
-            }
+            } => emit_table(out, ast, aligns, header, body, indent, hl),
         }
     }
+}
+
+/// kramdown's `<table>` emission at a given base indent: `<thead>` (only when
+/// a header row exists), `<tbody>`, and the rows two levels deeper. Shared by
+/// the top-level table block and a pipe-table living inside a `<li>`.
+fn emit_table(
+    out: &mut String,
+    ast: &Ast<'_>,
+    aligns: &[Align],
+    header: &Option<Vec<Option<u32>>>,
+    body: &[Vec<Option<u32>>],
+    indent: usize,
+    hl: &mut dyn CodeHighlighter,
+) {
+    push_pad(out, indent);
+    out.push_str("<table>\n");
+    if let Some(header) = header {
+        push_pad(out, indent + 2);
+        out.push_str("<thead>\n");
+        emit_table_row(out, ast, header, aligns, true, indent + 4, hl);
+        push_pad(out, indent + 2);
+        out.push_str("</thead>\n");
+    }
+    push_pad(out, indent + 2);
+    out.push_str("<tbody>\n");
+    for row in body {
+        emit_table_row(out, ast, row, aligns, false, indent + 4, hl);
+    }
+    push_pad(out, indent + 2);
+    out.push_str("</tbody>\n");
+    push_pad(out, indent);
+    out.push_str("</table>\n");
 }
 
 /// Emit a span element's IAL attributes (`[t](u){:.c}`), if any, from the
@@ -311,6 +324,25 @@ fn emit_list(
     while let Some(idx) = cur {
         let item = &ast.items[idx as usize];
         cur = item.next;
+        if let Some(bidx) = item.block {
+            // kramdown renders a list item holding a block-level element (here
+            // a pipe-table built from a `|`-bearing item line) in block form:
+            // `<li>` on its own line, the table one level deeper, `</li>` back
+            // at the item column.
+            push_pad(out, indent + 2);
+            out.push_str("<li>\n");
+            if let BlockKind::Table {
+                aligns,
+                header,
+                body,
+            } = &ast.blocks[bidx as usize].kind
+            {
+                emit_table(out, ast, aligns, header, body, indent + 4, hl);
+            }
+            push_pad(out, indent + 2);
+            out.push_str("</li>\n");
+            continue;
+        }
         if loose {
             // kramdown wraps each loose item's content in a `<p>`; loose
             // lists in the v1 subset never carry a nested child.

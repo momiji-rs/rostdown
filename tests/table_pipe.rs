@@ -68,6 +68,25 @@ fn clean_header_table_still_renders() {
 fn quirky_tables_decline() {
     // kramdown tables these, but outside our clean shape — decline (safe):
     declined("a | b | c\nd | e\n"); // ragged (rows differ in cell count)
-    declined("* a | b\n* c | d\n"); // pipe inside a list item → <li><table>
     declined("> quote | pipe\n"); // pipe inside a blockquote → <blockquote><table>
+    // A multi-line item (lazy/indented continuation) with a pipe — kramdown
+    // only tables an item whose every line is a row, so this stays out of
+    // subset.
+    declined("* a | b\n{% endfor %}\n"); // lead-0 lazy continuation, no pipe
+    declined("* a | b\n  cont | row\n"); // indented continuation
+}
+
+#[test]
+fn pipe_in_list_item_builds_per_item_table() {
+    // kramdown's GFM table trigger fires inside a `<li>` too: a single-line
+    // item with a `|` becomes a one-row `<table>`, rendered in block form.
+    ok(
+        "* a | b\n* c | d\n",
+        "<ul>\n  <li>\n    <table>\n      <tbody>\n        <tr>\n          <td>a</td>\n          <td>b</td>\n        </tr>\n      </tbody>\n    </table>\n  </li>\n  <li>\n    <table>\n      <tbody>\n        <tr>\n          <td>c</td>\n          <td>d</td>\n        </tr>\n      </tbody>\n    </table>\n  </li>\n</ul>\n",
+    );
+    // Mixed with a normal (pipe-less) item.
+    ok(
+        "* plain\n* x | y\n",
+        "<ul>\n  <li>plain</li>\n  <li>\n    <table>\n      <tbody>\n        <tr>\n          <td>x</td>\n          <td>y</td>\n        </tr>\n      </tbody>\n    </table>\n  </li>\n</ul>\n",
+    );
 }

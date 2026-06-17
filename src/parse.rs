@@ -184,6 +184,10 @@ pub(crate) struct ItemNode<'a> {
     /// carry at most text-then-one-child in our subset; anything richer
     /// (blank lines, content after the child) declines first.
     pub(crate) child: Option<(bool, Option<u32>)>,
+    /// A block-level element filling the item (a pipe-table kramdown builds
+    /// from a `|`-bearing item line). When set, `spans`/`child` are unused and
+    /// the item renders in block form. Indexes [`Ast::blocks`].
+    pub(crate) block: Option<u32>,
     pub(crate) next: Option<u32>,
     /// Lifetime tie: an `ItemNode` with all-`None` index fields would
     /// otherwise be `'static`. Keeps `'a` bound to `src`.
@@ -606,8 +610,13 @@ fn parse_blocks<'a>(
         // clean table. kramdown still makes a table iff EVERY line of the
         // block is a row; reproduce that decline. Otherwise the block is a
         // plain paragraph with literal pipes — fall through to the paragraph
-        // path (NOT a decline), matching kramdown.
-        if has_table_pipe(trim_start_ws(line)) && block_all_pipe(lines, i, opts) {
+        // path (NOT a decline), matching kramdown. A list-marker line is
+        // exempt: kramdown keeps it a list and builds a `<table>` per item, so
+        // it is the list handler's job (below), not a block-level decline.
+        if list_marker(line).is_none()
+            && has_table_pipe(trim_start_ws(line))
+            && block_all_pipe(lines, i, opts)
+        {
             return Err(declined("table"));
         }
 
@@ -920,7 +929,7 @@ fn parse_blocks<'a>(
         // (their content column is digits+2, not a fixed strip
         // width).
         if let Some(ordered) = list_marker(line) {
-            let (items, loose) = parse_list_items(ast, lines, &mut i, ordered)?;
+            let (items, loose) = parse_list_items(ast, lines, &mut i, ordered, opts)?;
             emit_block!(BlockKind::List {
                 ordered,
                 loose,
@@ -943,7 +952,7 @@ fn parse_blocks<'a>(
                 .map(|l| l.strip_prefix(pad).unwrap_or(l))
                 .collect();
             let mut k = 0;
-            let (items, loose) = parse_list_items(ast, &deindented, &mut k, ordered)?;
+            let (items, loose) = parse_list_items(ast, &deindented, &mut k, ordered, opts)?;
             // The blanket base de-indent also strips a lazy continuation's
             // OWN leading whitespace, but kramdown keeps a lazy line (indent
             // below the item's content column) verbatim. Where a consumed
@@ -1663,6 +1672,7 @@ fn parse_list_items<'a>(
     lines: &[&'a str],
     i: &mut usize,
     ordered: bool,
+    opts: &Options,
 ) -> Result<(Option<u32>, bool), Error> {
     // The items of THIS level, sibling-linked.
     let mut items = Chain::new();
@@ -1720,12 +1730,46 @@ fn parse_list_items<'a>(
             }
             via_blank = false;
             let content = strip_marker(l, ordered);
-            // Item content is block-level in kramdown — tables,
-            // EOB markers, IALs etc. inside an item are out of
-            // subset, same as at the top level. A `|` inside an item makes
-            // kramdown render a `<table>` inside the `<li>` (out of subset).
+            // Item content is block-level in kramdown — EOB markers, IALs etc.
+            // inside an item are out of subset, same as at the top level. A
+            // `|` makes kramdown render a `<table>` inside the `<li>`: support
+            // the common single-line item (no indented continuation) by
+            // building a one-row table; the multi-line / indented form stays
+            // out of subset (decline).
             if has_table_pipe(trim_start_ws(content)) {
-                return Err(declined("table"));
+                // kramdown makes a `<table>` inside the `<li>` only when EVERY
+                // line of the item's content is a pipe-row. We support the
+                // single-line item: the next line must end this item — blank,
+                // end-of-input, or a same-kind sibling marker. Anything else
+                // (a lazy/indented continuation, with or without its own pipe)
+                // is a multi-line item, out of subset → decline.
+                let single_line = match lines.get(*i + 1) {
+                    None => true,
+                    Some(nl) => is_blank(nl) || list_marker(nl) == Some(ordered),
+                };
+                if !single_line {
+                    return Err(declined("table"));
+                }
+                let Some((table_kind, _)) = try_parse_table(ast, &[content], 0, opts)? else {
+                    return Err(declined("table"));
+                };
+                if let Some(prev) = cur_item {
+                    ast.items[prev as usize].spans = cur_spans.first();
+                }
+                let bidx = ast.push_block(table_kind);
+                let item_idx = ast.push_item(ItemNode {
+                    spans: None,
+                    child: None,
+                    block: Some(bidx),
+                    next: None,
+                    _marker: std::marker::PhantomData,
+                });
+                items.link(item_idx, |p, n| ast.items[p as usize].next = Some(n));
+                cur_item = Some(item_idx);
+                cur_spans = Chain::new();
+                cur_has_child = false;
+                *i += 1;
+                continue;
             }
             decline_block_scan(content)?;
             // Trailing whitespace carries hard-break semantics.
@@ -1743,6 +1787,7 @@ fn parse_list_items<'a>(
             let item_idx = ast.push_item(ItemNode {
                 spans: spans.first(),
                 child: None,
+                block: None,
                 next: None,
                 _marker: std::marker::PhantomData,
             });
@@ -1817,7 +1862,7 @@ fn parse_list_items<'a>(
                         .expect("loop exit condition");
                     let mut k = j;
                     let (child_items, child_loose) =
-                        parse_list_items(ast, &tail, &mut k, child_ordered)?;
+                        parse_list_items(ast, &tail, &mut k, child_ordered, opts)?;
                     if child_loose {
                         // A loose nested list is out of the v1 subset.
                         return Err(declined("loose-nested-list"));
