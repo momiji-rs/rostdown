@@ -1,0 +1,51 @@
+//! Fenced code blocks with varying fence lengths. kramdown opens on a run
+//! of ≥3 backticks/tildes and closes on a run of the SAME char at least as
+//! long (no info string) — so a longer fence closes a shorter one, and a
+//! shorter run inside a longer fence is literal content. Expected HTML
+//! mirrors kramdown 2.5.2 under the gem profile (`Options::jekyll()`,
+//! NoHighlight).
+
+use rostdown::{Error, NoHighlight, Options, to_html};
+
+fn render(src: &str) -> Result<String, Error> {
+    to_html(src, &Options::jekyll(), &mut NoHighlight)
+}
+
+#[track_caller]
+fn ok(src: &str, expected: &str) {
+    match render(src) {
+        Ok(html) => assert_eq!(html, expected, "input: {src:?}"),
+        Err(e) => panic!("expected byte-identical render, declined {src:?}: {e:?}"),
+    }
+}
+
+#[test]
+fn three_closes_three() {
+    ok(
+        "```sh\ncode line\n```\n",
+        "<pre><code class=\"language-sh\">code line\n</code></pre>\n",
+    );
+}
+
+#[test]
+fn four_backtick_line_closes_a_three_fence() {
+    // The real-world shape: a 3-fence accidentally closed with 4 backticks.
+    ok("```\na\n````\n", "<pre><code>a\n</code></pre>\n");
+}
+
+#[test]
+fn four_open_four_close() {
+    ok(
+        "````sh\nb\n````\n",
+        "<pre><code class=\"language-sh\">b\n</code></pre>\n",
+    );
+}
+
+#[test]
+fn shorter_run_inside_longer_fence_is_content() {
+    // A bare ``` (3) and a ```-prefixed line do NOT close a 4-fence.
+    ok(
+        "````\ninner ```\nstill code\n````\n",
+        "<pre><code>inner ```\nstill code\n</code></pre>\n",
+    );
+}

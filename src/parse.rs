@@ -627,16 +627,18 @@ fn parse_blocks<'a>(
             continue;
         }
 
-        // Fenced code block.
-        let fence = if opts.gfm && line.starts_with("```") {
-            Some("```")
-        } else if line.starts_with("~~~") {
-            Some("~~~")
-        } else {
-            None
+        // Fenced code block. The opening fence is a run of ≥3 backticks
+        // (GFM) or tildes; kramdown closes it with a run of the SAME char
+        // at least as long, carrying no info string — so a ```` ```` ````
+        // line closes a ``` ``` ``` fence.
+        let fence_char = match line.as_bytes().first() {
+            Some(&b'`') if opts.gfm => Some(b'`'),
+            Some(&b'~') => Some(b'~'),
+            _ => None,
         };
-        if let Some(fence) = fence {
-            let info = line[fence.len()..].trim();
+        let fence_len = fence_char.map_or(0, |c| run_len(line.as_bytes(), 0, c));
+        if let Some(fence_char) = fence_char.filter(|_| fence_len >= 3) {
+            let info = line[fence_len..].trim();
             if info.contains('`') || info.contains('{') {
                 return Err(declined("fence-info"));
             }
@@ -664,7 +666,11 @@ fn parse_blocks<'a>(
             let mut closed = false;
             while i < lines.len() {
                 let l = lines[i];
-                if trim_end_ws(l) == fence {
+                // Closing fence: a run of the same char, at least as long
+                // as the opener, and nothing else (info strings are not
+                // allowed on a closing fence).
+                let t = trim_end_ws(l);
+                if t.len() >= fence_len && t.bytes().all(|b| b == fence_char) {
                     closed = true;
                     break;
                 }
