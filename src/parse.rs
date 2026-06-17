@@ -80,7 +80,11 @@ impl<'a> Ast<'a> {
     #[inline]
     fn push_block(&mut self, kind: BlockKind<'a>) -> u32 {
         let idx = self.blocks.len() as u32;
-        self.blocks.push(BlockNode { kind, next: None });
+        self.blocks.push(BlockNode {
+            kind,
+            next: None,
+            ial: Vec::new(),
+        });
         idx
     }
 
@@ -98,6 +102,10 @@ impl<'a> Ast<'a> {
 pub(crate) struct BlockNode<'a> {
     pub(crate) kind: BlockKind<'a>,
     pub(crate) next: Option<u32>,
+    /// Block IAL attributes (`{:.class}` etc.) in kramdown's insertion
+    /// order — `(name, value)`, with classes accumulated under `class`.
+    /// Empty for the common block with none.
+    pub(crate) ial: Vec<(Cow<'a, str>, String)>,
 }
 
 #[derive(Debug)]
@@ -385,6 +393,93 @@ fn trim_end_ws(s: &str) -> &str {
     &s[..end]
 }
 
+/// Insert or update `key` in an insertion-ordered attribute list.
+fn set_attr<'a>(attrs: &mut Vec<(Cow<'a, str>, String)>, key: Cow<'a, str>, val: String) {
+    if let Some(e) = attrs.iter_mut().find(|(k, _)| k.as_ref() == key.as_ref()) {
+        e.1 = val;
+    } else {
+        attrs.push((key, val));
+    }
+}
+
+/// Parse a block IAL's inner content (between `{:` and `}`) into kramdown's
+/// insertion-ordered attribute list: `.class` (dot- or space-separated)
+/// accumulates under `class`, `#id` sets `id`, and `key="v"` / `key='v'` /
+/// `key=v` set arbitrary attributes. `None` for a bare name (an ALD
+/// reference / `{:toc}`) or a malformed token — those decline.
+fn parse_ial(content: &str) -> Option<Vec<(Cow<'_, str>, String)>> {
+    let mut attrs: Vec<(Cow<'_, str>, String)> = Vec::new();
+    let b = content.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        while i < b.len() && matches!(b[i], b' ' | b'\t') {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        match b[i] {
+            b'.' => {
+                let s = i + 1;
+                let mut j = s;
+                while j < b.len() && !matches!(b[j], b' ' | b'\t' | b'.' | b'#') {
+                    j += 1;
+                }
+                if j == s {
+                    return None;
+                }
+                let cls = &content[s..j];
+                if let Some(e) = attrs.iter_mut().find(|(k, _)| k.as_ref() == "class") {
+                    e.1.push(' ');
+                    e.1.push_str(cls);
+                } else {
+                    attrs.push((Cow::Borrowed("class"), cls.to_string()));
+                }
+                i = j;
+            }
+            b'#' => {
+                let s = i + 1;
+                let mut j = s;
+                while j < b.len() && !matches!(b[j], b' ' | b'\t' | b'.' | b'#') {
+                    j += 1;
+                }
+                if j == s {
+                    return None;
+                }
+                set_attr(&mut attrs, Cow::Borrowed("id"), content[s..j].to_string());
+                i = j;
+            }
+            _ => {
+                let s = i;
+                let mut j = i;
+                while j < b.len() && !matches!(b[j], b' ' | b'\t' | b'=') {
+                    j += 1;
+                }
+                if j == s || j >= b.len() || b[j] != b'=' {
+                    return None; // bare name (ALD ref / toc) or malformed
+                }
+                let key = &content[s..j];
+                let vs = j + 1;
+                let (val, next) = if matches!(b.get(vs), Some(b'"' | b'\'')) {
+                    let q = b[vs];
+                    let inner = &content[vs + 1..];
+                    let end = inner.bytes().position(|c| c == q)?;
+                    (inner[..end].to_string(), vs + 1 + end + 1)
+                } else {
+                    let mut k = vs;
+                    while k < b.len() && !matches!(b[k], b' ' | b'\t') {
+                        k += 1;
+                    }
+                    (content[vs..k].to_string(), k)
+                };
+                set_attr(&mut attrs, Cow::Borrowed(key), val);
+                i = next;
+            }
+        }
+    }
+    if attrs.is_empty() { None } else { Some(attrs) }
+}
+
 fn parse_blocks<'a>(
     ast: &mut Ast<'a>,
     src: &'a str,
@@ -409,6 +504,27 @@ fn parse_blocks<'a>(
             }
             emit_block!(BlockKind::Blank);
             continue;
+        }
+
+        // A block IAL line (`{:.class}` …) immediately after a paragraph
+        // attaches its attributes to that paragraph. Span IALs, ALDs,
+        // `{::}` extensions, `{:toc}`, IALs after a blank or after other
+        // block types are out of subset and fall through to decline.
+        if line.trim_start_matches([' ', '\t']).starts_with("{:")
+            && !line.trim_start_matches([' ', '\t']).starts_with("{::")
+            && line.len() - line.trim_start_matches(' ').len() <= 3
+        {
+            let t = line.trim_matches([' ', '\t']);
+            if let Some(inner) = t.strip_prefix("{:").and_then(|s| s.strip_suffix('}'))
+                && let Some(last) = chain.last
+                && matches!(ast.blocks[last as usize].kind, BlockKind::Para(_))
+                && ast.blocks[last as usize].ial.is_empty()
+                && let Some(attrs) = parse_ial(inner)
+            {
+                ast.blocks[last as usize].ial = attrs;
+                i += 1;
+                continue;
+            }
         }
 
         // A top-level pipe table. Heading/list/quote/fence take precedence
@@ -717,6 +833,17 @@ fn parse_blocks<'a>(
                     || l.starts_with("~~~"))
             {
                 break;
+            }
+            // A block IAL line ends the paragraph; the main loop then
+            // attaches its attributes to this paragraph.
+            if !first {
+                let lt = l.trim_start_matches([' ', '\t']);
+                if lt.starts_with("{:")
+                    && !lt.starts_with("{::")
+                    && l.len() - l.trim_start_matches(' ').len() <= 3
+                {
+                    break;
+                }
             }
             // A swallowed opener-looking line renders as literal text in
             // kramdown; our spans handle `#`/`>` fine, but hr runs would
@@ -2616,6 +2743,37 @@ mod byte_opt_tests {
 
         // reference-style image with no matching definition ⇒ not inline
         assert!(parse_image(&ast, "![a][r]").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_ial_cases() {
+        // (verified byte-identical against kramdown 2.5.2)
+        let pairs = |s: &str| {
+            parse_ial(s).map(|v| {
+                v.into_iter()
+                    .map(|(k, val)| (k.into_owned(), val))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let p = |kv: &[(&str, &str)]| {
+            Some(
+                kv.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(pairs(".note"), p(&[("class", "note")]));
+        assert_eq!(pairs(".a.b.c"), p(&[("class", "a b c")])); // dot-concat
+        assert_eq!(pairs(".a .b #i"), p(&[("class", "a b"), ("id", "i")]));
+        // insertion order is preserved (id before class here)
+        assert_eq!(pairs("#i .c"), p(&[("id", "i"), ("class", "c")]));
+        assert_eq!(
+            pairs(r#"title="x" .c #i"#),
+            p(&[("title", "x"), ("class", "c"), ("id", "i")])
+        );
+        assert_eq!(pairs(r#"rel="noopener""#), p(&[("rel", "noopener")]));
+        assert_eq!(pairs("toc"), None); // bare name (ALD ref) ⇒ decline
+        assert_eq!(pairs(""), None);
     }
 
     #[test]

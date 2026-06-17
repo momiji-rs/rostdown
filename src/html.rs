@@ -9,6 +9,7 @@
 //! `" ".repeat()` pad strings, and `escape_*` copies non-special runs in
 //! bulk. Output stays byte-identical (the golden corpus is the gate).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::parse::{Align, Ast, BlockKind, SpanKind};
@@ -114,7 +115,9 @@ fn convert_blocks(
             }
             BlockKind::Para(spans) => {
                 push_pad(out, indent);
-                out.push_str("<p>");
+                out.push_str("<p");
+                emit_attrs(out, &block.ial);
+                out.push('>');
                 convert_spans(out, ast, *spans, hl.codespan_class());
                 out.push_str("</p>\n");
             }
@@ -203,6 +206,18 @@ fn convert_blocks(
                 out.push_str("</table>\n");
             }
         }
+    }
+}
+
+/// Emit an IAL's attributes into an open tag: ` key="value"` per pair in
+/// insertion order, the value HTML-attr-escaped.
+fn emit_attrs(out: &mut String, attrs: &[(Cow<'_, str>, String)]) {
+    for (key, value) in attrs {
+        out.push(' ');
+        out.push_str(key);
+        out.push_str("=\"");
+        escape_attr(out, value);
+        out.push('"');
     }
 }
 
