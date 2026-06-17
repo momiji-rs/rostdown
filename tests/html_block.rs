@@ -64,12 +64,18 @@ fn names_lowercased_attrs_normalized() {
 }
 
 #[test]
-fn text_and_raw_code_escaping() {
-    // Text nodes escape `<`/`>`/bare-`&`; entities stay verbatim; a nested
-    // `<code>` (raw) escapes its body the same way.
+fn text_and_code_nested_tags() {
+    // Text nodes escape `<`/`>`/bare-`&`; entities stay verbatim. A nested
+    // `<code>` is span-content: a WELL-FORMED nested tag is re-serialized
+    // (not escaped), while a bare `<` becomes `&lt;` and markdown stays
+    // literal.
     ok(
-        "<div><code>a<b & c</code> &amp; &copy;</div>\n",
-        "<div><code>a&lt;b &amp; c</code> &amp; &copy;</div>\n",
+        "<div><code><a href=\"u\">y</a></code> &amp; &copy;</div>\n",
+        "<div><code><a href=\"u\">y</a></code> &amp; &copy;</div>\n",
+    );
+    ok(
+        "<div><code>a &lt; b</code> **lit**</div>\n",
+        "<div><code>a &lt; b</code> **lit**</div>\n",
     );
 }
 
@@ -106,8 +112,27 @@ fn custom_and_unknown_block_elements() {
 }
 
 #[test]
+fn table_family_reserialized() {
+    // kramdown re-serializes a raw `<table>` through the ordinary block path
+    // (names lowercased, void children ` />`, bare attrs quoted, text
+    // verbatim, markdown NOT parsed) — like a div. The common Jekyll-docs
+    // shape is a `<table>` wrapped in a scroller `<div>`.
+    ok(
+        "<table class=\"t\">\n<tr><td>**a**</td><td></td></tr>\n</table>\n",
+        "<table class=\"t\">\n<tr><td>**a**</td><td></td></tr>\n</table>\n",
+    );
+    ok(
+        "<TABLE>\n<TR><TD CLASS=x>cell<BR></TD></TR>\n</TABLE>\n",
+        "<table>\n<tr><td class=\"x\">cell<br /></td></tr>\n</table>\n",
+    );
+    ok(
+        "<div class=\"mobile-side-scroller\">\n<table>\n  <thead>\n    <tr><th>Setting</th></tr>\n  </thead>\n</table>\n</div>\n",
+        "<div class=\"mobile-side-scroller\">\n<table>\n  <thead>\n    <tr><th>Setting</th></tr>\n  </thead>\n</table>\n</div>\n",
+    );
+}
+
+#[test]
 fn out_of_subset_declines() {
-    declined("<table class=\"x\">\n<tr><td>a</td></tr>\n</table>\n"); // table family is :raw
     declined("<!-- a comment -->\n"); // comment
     declined("<div markdown=\"1\">\n**b**\n</div>\n"); // markdown= changes parsing
     declined("<script>var x=1;</script>\n"); // raw, no-escape content

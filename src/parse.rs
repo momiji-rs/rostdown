@@ -2380,11 +2380,7 @@ fn parse_spans_until<'a>(
                     };
                     match el {
                         crate::html_block::Inline::Void(html) => push_raw(ast, &mut chain, html),
-                        crate::html_block::Inline::Raw { open, body, close } => {
-                            push_raw(ast, &mut chain, open);
-                            push_raw(ast, &mut chain, body);
-                            push_raw(ast, &mut chain, close);
-                        }
+                        crate::html_block::Inline::Raw(html) => push_raw(ast, &mut chain, html),
                         crate::html_block::Inline::Markdown { open, content, close } => {
                             push_raw(ast, &mut chain, open);
                             let inner = parse_spans(ast, content)?;

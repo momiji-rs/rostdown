@@ -9,11 +9,12 @@
 //!
 //! We reproduce a conservative subset and DECLINE the rest (so the document
 //! falls back to Ruby kramdown, never renders wrong): the block must start
-//! at column 0 with a block-level container element and close at a line
-//! boundary; raw-text elements with non-text escaping (`script`, `style`,
-//! `pre`, `table` family, …), comments, doctypes, processing instructions,
-//! a `markdown=` attribute, and any malformed / unclosed / mismatched
-//! structure all bail to `None`.
+//! at column 0 with a block-level container element (including the `table`
+//! family and unknown/custom elements) and close at a line boundary;
+//! raw-content elements with bespoke escaping (`script`, `style`, `pre`,
+//! `textarea`, `title`, `option`, `math`), comments, doctypes, processing
+//! instructions, a `markdown=` attribute, and any malformed / unclosed /
+//! mismatched structure all bail to `None`.
 
 /// kramdown `HTML_ELEMENTS_WITHOUT_BODY` — serialized ` />`, no close tag.
 fn is_void(name: &str) -> bool {
@@ -38,35 +39,29 @@ fn is_void(name: &str) -> bool {
     )
 }
 
-/// Raw-content elements whose body is read verbatim to the close tag and
-/// then HTML-escaped exactly like ordinary text (`<code>a<b</code>` →
-/// `<code>a&lt;b</code>`) — no nested-tag parsing.
+/// Span-content elements (`code`/`kbd`/`samp`/`var`) whose body kramdown
+/// parses for nested HTML but NOT markdown: a well-formed nested tag is
+/// re-serialized (`<code><a href="…">x</a></code>` kept), text is escaped,
+/// and a `**bold**` stays literal. [`element`] produces exactly this, so they
+/// flow through the ordinary element path — this predicate only marks them as
+/// inline (for `is_inline`) and selects the no-markdown inline route.
 fn is_escaped_raw(name: &str) -> bool {
     matches!(name, "code" | "kbd" | "samp" | "var")
 }
 
 /// Raw-content elements kramdown serializes WITHOUT escaping (`<script>`,
-/// `<style>`, `<math>`) or with bespoke rules (`pre`, `textarea`, `table`
-/// family). Out of subset — decline.
+/// `<style>`, `<math>`) or with bespoke whitespace rules (`pre`, `textarea`,
+/// `title`, `option`). Out of subset — decline.
+///
+/// The table family (`table`/`thead`/`tbody`/`tfoot`/`tr`/`td`/`th`/`caption`/
+/// `colgroup`) is NOT here: kramdown re-serializes those through the ordinary
+/// block-element tree path (names lowercased, void children ` />`, text
+/// verbatim, markdown not parsed) — exactly what [`serialize`] produces — so
+/// they are in subset.
 fn is_decline_raw(name: &str) -> bool {
     matches!(
         name,
-        "script"
-            | "style"
-            | "math"
-            | "textarea"
-            | "title"
-            | "option"
-            | "pre"
-            | "table"
-            | "thead"
-            | "tbody"
-            | "tfoot"
-            | "tr"
-            | "td"
-            | "th"
-            | "caption"
-            | "colgroup"
+        "script" | "style" | "math" | "textarea" | "title" | "option" | "pre"
     )
 }
 
@@ -225,18 +220,11 @@ impl<'a> Parser<'a> {
         }
         out.push('>');
 
-        if is_escaped_raw(&name) {
-            // Body is verbatim up to the matching close tag, then escaped.
-            let close = format!("</{name}>");
-            let rest = &self.s[self.pos..];
-            let end = find_close_ci(rest, &name)?;
-            Self::push_escaped_text(out, &rest[..end]);
-            self.pos += end + close.len();
-            out.push_str(&close);
-            return Some(());
-        }
-
         // Normal content: text runs and nested elements until our close tag.
+        // This includes `code`/`kbd`/`samp`/`var`: in block context kramdown
+        // gives them a `:span` content model, so a well-formed nested tag
+        // (`<code><a href="…">x</a></code>`) is re-serialized as an element,
+        // NOT escaped; only a bare/malformed `<` becomes `&lt;`.
         loop {
             match self.peek()? {
                 b'<' => match self.b.get(self.pos + 1) {
@@ -375,32 +363,6 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Find the matching `</name>` (case-insensitive) in `s`, returning the byte
-/// offset of the `<`. Used only for escaped-raw elements (no nesting).
-fn find_close_ci(s: &str, name: &str) -> Option<usize> {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i + 2 < b.len() {
-        if b[i] == b'<' && b[i + 1] == b'/' {
-            let after = &s[i + 2..];
-            let nend = after
-                .bytes()
-                .position(|c| !(c.is_ascii_alphanumeric() || c == b'-'))?;
-            if after[..nend].eq_ignore_ascii_case(name) {
-                let mut p = i + 2 + nend;
-                while b.get(p).is_some_and(|c| matches!(c, b' ' | b'\t')) {
-                    p += 1;
-                }
-                if b.get(p) == Some(&b'>') {
-                    return Some(i);
-                }
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
 /// Inline (span-level) HTML elements kramdown re-serializes in span context
 /// while parsing markdown inside them.
 fn is_inline(name: &str) -> bool {
@@ -446,13 +408,10 @@ fn is_inline(name: &str) -> bool {
 pub(crate) enum Inline<'a> {
     /// Void element (`<br>` → `<br />`): emit `html` verbatim.
     Void(String),
-    /// Raw-content element (`<code>`/`<kbd>`/…): emit `open`, the HTML-escaped
-    /// `body`, then `close`, all verbatim (no markdown inside).
-    Raw {
-        open: String,
-        body: String,
-        close: String,
-    },
+    /// Span-content element with markdown NOT parsed inside
+    /// (`code`/`kbd`/`samp`/`var`): the whole element is already serialized
+    /// (nested tags kept, text escaped) — emit `html` verbatim.
+    Raw(String),
     /// Normal element: emit `open`, then the markdown-parsed `content`, then
     /// `close`.
     Markdown {
@@ -529,6 +488,20 @@ pub(crate) fn inline_at(s: &str) -> Option<(Inline<'_>, usize)> {
     if !is_inline(&name) {
         return None; // block-level / unknown inline element — out of subset
     }
+    if is_escaped_raw(&name) {
+        // code/kbd/samp/var: span content model — nested HTML elements are
+        // kept (re-serialized), text is escaped, and markdown is NOT parsed.
+        // element() produces exactly that and declines on kramdown's quirky
+        // unclosed-/mismatched-tag recovery (out of subset).
+        let mut whole = String::with_capacity(s.len());
+        let mut ep = Parser {
+            b: s.as_bytes(),
+            s,
+            pos: 0,
+        };
+        ep.element(&mut whole)?;
+        return Some((Inline::Raw(whole), ep.pos));
+    }
     let mut open = String::with_capacity(name.len() + 8);
     open.push('<');
     open.push_str(&name);
@@ -546,12 +519,6 @@ pub(crate) fn inline_at(s: &str) -> Option<(Inline<'_>, usize)> {
     let content_start = p.pos;
     let (content_end, after_close) = find_inline_close(s, content_start, &name)?;
     let content = &s[content_start..content_end];
-
-    if is_escaped_raw(&name) {
-        let mut body = String::new();
-        Parser::push_escaped_text(&mut body, content);
-        return Some((Inline::Raw { open, body, close }, after_close));
-    }
     Some((Inline::Markdown { open, content, close }, after_close))
 }
 
@@ -588,9 +555,11 @@ mod tests {
         assert!(is_void("img") && is_void("br") && is_void("hr"));
         assert!(!is_void("div") && !is_void("span"));
         assert!(is_escaped_raw("code") && !is_escaped_raw("div"));
-        assert!(is_decline_raw("script") && is_decline_raw("table") && is_decline_raw("pre"));
+        assert!(is_decline_raw("script") && is_decline_raw("pre") && !is_decline_raw("table"));
         assert!(is_block_start("div") && is_block_start("figure") && is_block_start("p"));
-        assert!(!is_block_start("span") && !is_block_start("a") && !is_block_start("table"));
+        // The table family is now a block start (re-serialized like a div).
+        assert!(is_block_start("table") && is_block_start("td") && is_block_start("tr"));
+        assert!(!is_block_start("span") && !is_block_start("a") && !is_block_start("code"));
     }
 
     #[test]
@@ -598,8 +567,9 @@ mod tests {
         assert!(starts_html_block("<div class=\"x\">"));
         assert!(starts_html_block("<figure>"));
         assert!(starts_html_block("<DIV>")); // case-insensitive
+        assert!(starts_html_block("<table>")); // table family re-serialized
         assert!(!starts_html_block("<span>x</span>")); // span not a block start
-        assert!(!starts_html_block("<table>")); // raw → not a start
+        assert!(!starts_html_block("<code>x</code>")); // code is span/inline
         assert!(!starts_html_block("<!-- c -->")); // comment
         assert!(!starts_html_block("not a tag"));
         assert!(!starts_html_block("<")); // bare
@@ -628,12 +598,22 @@ mod tests {
             ser("<div title='a\"b<c&d'>x</div>").as_deref(),
             Some("<div title=\"a&quot;b&lt;c&amp;d\">x</div>")
         );
+        // table family re-serialized like a div: names lowercased, void child
+        // ` />`, text verbatim (markdown not parsed).
+        assert_eq!(
+            ser("<TABLE>\n<TR><TD CLASS=x>**a**<BR></TD></TR>\n</TABLE>\n").as_deref(),
+            Some("<table>\n<tr><td class=\"x\">**a**<br /></td></tr>\n</table>")
+        );
+        // code in block context: well-formed nested tag kept (NOT escaped).
+        assert_eq!(
+            ser("<div><code><a href=\"u\">y</a></code></div>").as_deref(),
+            Some("<div><code><a href=\"u\">y</a></code></div>")
+        );
     }
 
     #[test]
     fn serialize_declines() {
         assert_eq!(ser("<!-- c -->"), None); // comment
-        assert_eq!(ser("<table><tr><td>a</td></tr></table>"), None); // raw family
         assert_eq!(ser("<div markdown=\"1\">x</div>"), None); // markdown attr
         assert_eq!(ser("<div>unclosed"), None); // no close
         assert_eq!(ser("<div>a</div> trailing"), None); // trailing content

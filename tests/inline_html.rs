@@ -72,10 +72,19 @@ fn non_void_inline_with_markdown_content() {
         "q <q>quoted \"x\"</q> e\n",
         "<p>q <q>quoted \u{201c}x\u{201d}</q> e</p>\n",
     );
-    // Raw-content inline element: body escaped, no markdown inside.
+    // Span-content inline element (`<code>`): markdown NOT parsed, but a
+    // well-formed nested tag is re-serialized and a bare `<` is escaped.
     ok(
-        "a <code>x<y & z</code> b\n",
-        "<p>a <code>x&lt;y &amp; z</code> b</p>\n",
+        "a <code>x &lt; y **lit**</code> b\n",
+        "<p>a <code>x &lt; y **lit**</code> b</p>\n",
+    );
+    ok(
+        "a <code><a href=\"u\">y</a></code> b\n",
+        "<p>a <code><a href=\"u\">y</a></code> b</p>\n",
+    );
+    ok(
+        "a <samp>p<em>q</em></samp> b\n",
+        "<p>a <samp>p<em>q</em></samp> b</p>\n",
     );
 }
 
@@ -90,4 +99,8 @@ fn inline_html_out_of_subset_declines() {
     declined("a <span>x <span>y</span> z</span> b\n");
     // An attribute value spanning a line break (kramdown normalizes it).
     declined("Link: <a href=\"test\nfoo\">x</a>\n");
+    // A malformed/unclosed tag inside `<code>` — kramdown's recovery (it
+    // swallows past the close tag) is out of subset, so decline.
+    declined("a <code>x<y & z</code> b\n");
+    declined("a <code>vector<int></code> b\n");
 }
