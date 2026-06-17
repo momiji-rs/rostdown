@@ -3199,20 +3199,72 @@ fn parse_link<'a>(
     if bytes.get(close + 1) != Some(&b'(') {
         return resolve_ref_link(ast, rest, close, in_em, in_strong);
     }
-    let after = &rest[close + 2..];
-    let Some(paren_rel) = after.find(')') else {
+    // kramdown's destination scan (LINK_PAREN_STOP_RE) from the opening `(`:
+    // track paren depth — a `(` nests, a `)` at depth 0 closes the link (no
+    // title) — but whitespace directly before a `"`/`'` ends the destination
+    // and starts a title. So `[t](a(b)c)` → `a(b)c`, `[t]((u))` → `(u)`, and
+    // `[t](a(b "t")` → href `a(b)`/`a(b` with title `t` (the unbalanced `(`
+    // is kept). `<…>` angle destinations use a separate scan — out of subset.
+    let rb = rest.as_bytes();
+    let dest_start = close + 2;
+    let mut nr = 0i32;
+    let mut q = close + 1; // at the '('
+    let mut href_end = None;
+    let mut title: Option<&str> = None;
+    let mut link_end = None;
+    while q < rb.len() {
+        match rb[q] {
+            b'(' => {
+                nr += 1;
+                q += 1;
+            }
+            b')' => {
+                nr -= 1;
+                if nr == 0 {
+                    href_end = Some(q);
+                    link_end = Some(q + 1);
+                    break;
+                }
+                q += 1;
+            }
+            b' ' | b'\t' | b'\n' if matches!(rb.get(q + 1), Some(b'"') | Some(b'\'')) => {
+                // Whitespace before a quote: destination ends, a title follows
+                // (LINK_INLINE_TITLE_RE: quote, content, quote, ws?, `)`).
+                href_end = Some(q);
+                let qch = rb[q + 1];
+                let tstart = q + 2;
+                let mut t = tstart;
+                let tend = loop {
+                    match rb.get(t) {
+                        Some(&c) if c == qch => break t,
+                        Some(b'\n') | None => return Ok(None), // unterminated title
+                        _ => t += 1,
+                    }
+                };
+                if tend == tstart {
+                    // kramdown's title is `.+?` (≥1 char); an empty `''`/`""`
+                    // is not a title, so the whole `[…](…)` stays literal.
+                    return Ok(None);
+                }
+                let mut r = tend + 1;
+                while matches!(rb.get(r), Some(b' ') | Some(b'\t')) {
+                    r += 1;
+                }
+                if rb.get(r) != Some(&b')') {
+                    return Ok(None); // junk after the title ⇒ literal
+                }
+                title = Some(&rest[tstart..tend]);
+                link_end = Some(r + 1);
+                break;
+            }
+            _ => q += 1, // any other byte (incl. `\n`) is part of the destination
+        }
+    }
+    let (Some(href_end), Some(link_end)) = (href_end, link_end) else {
         return Ok(None);
     };
-    let Some((href, title)) = split_href_title(&after[..paren_rel]) else {
-        // Quote present but the title is malformed (e.g. `url "t" extra`):
-        // kramdown treats the whole `[…](…)` as literal text.
-        return Ok(None);
-    };
-    // Balanced parens in a URL (`…/Foo_(bar)`) and angle-bracket
-    // destinations (`<with spaces>`) need kramdown's quirkier dest scan
-    // (it even keeps an unbalanced `(` with a following title) — the cheap
-    // first-`)` scan can't reproduce them, so decline rather than truncate.
-    if href.contains('(') || href.starts_with('<') {
+    let href = rest[dest_start..href_end].trim_matches([' ', '\t']);
+    if href.starts_with('<') {
         return Err(declined("link-dest"));
     }
     let (spans, _) =
@@ -3222,7 +3274,7 @@ fn parse_link<'a>(
         spans,
         Cow::Borrowed(href),
         title.map(Cow::Borrowed),
-        close + 2 + paren_rel + 1,
+        link_end,
     )))
 }
 

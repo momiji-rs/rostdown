@@ -65,10 +65,24 @@ fn no_nested_links() {
 }
 
 #[test]
+fn balanced_parens_in_destination() {
+    // kramdown depth-matches the destination's parens: a `(` nests and the
+    // link closes at the `)` seen at depth 0.
+    ok(
+        "[Fork](https://x/Fork_(software_development))\n",
+        "<p><a href=\"https://x/Fork_(software_development)\">Fork</a></p>\n",
+    );
+    // A doubled opening paren keeps the inner one in the href.
+    ok(
+        "[t]((https://x/y))\n",
+        "<p><a href=\"(https://x/y)\">t</a></p>\n",
+    );
+}
+
+#[test]
 fn quirky_destinations_decline() {
-    // Balanced/unbalanced parens and angle-bracket destinations need
-    // kramdown's quirkier dest scan — declined (safe), not truncated.
-    declined("[Fork](https://x/Fork_(software_development))\n");
+    // An angle-bracket destination needs kramdown's separate `<…>` scan —
+    // declined (safe), not truncated.
     declined("[y](<a b>)\n");
 }
 
@@ -80,4 +94,24 @@ fn smart_quote_after_code_span_declines() {
     // followed by a quote, and a normal smart quote, still render.)
     declined("a `code`'d here\n");
     ok("a `code` then text\n", "<p>a <code>code</code> then text</p>\n");
+}
+
+#[test]
+fn depth_matched_dest_with_title_and_edges() {
+    // A title after a paren-containing dest, and a `)` inside the title quote.
+    ok(
+        "[t](a(b) \"the title\")\n",
+        "<p><a href=\"a(b)\" title=\"the title\">t</a></p>\n",
+    );
+    ok(
+        "[t](a \"b)c\")\n",
+        "<p><a href=\"a\" title=\"b)c\">t</a></p>\n",
+    );
+    // The first depth-0 `)` closes; trailing parens stay literal.
+    ok(
+        "[t](url) and (more).\n",
+        "<p><a href=\"url\">t</a> and (more).</p>\n",
+    );
+    // An empty title `''`/`""` is not a title (kramdown's `.+?`) — literal.
+    declined("[t](u '')\n");
 }
