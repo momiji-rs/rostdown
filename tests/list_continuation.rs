@@ -144,7 +144,7 @@ fn opt_space_list_interrupts_paragraph() {
     // continuation text).
     ok(
         "intro text:\n  - item one\n  - item two\n",
-        "<p>intro text:</p>\n\n<ul>\n  <li>item one</li>\n  <li>item two</li>\n</ul>\n",
+        "<p>intro text:</p>\n<ul>\n  <li>item one</li>\n  <li>item two</li>\n</ul>\n",
     );
 }
 
