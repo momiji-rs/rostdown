@@ -160,3 +160,19 @@ fn raw_text_script_and_style_render_verbatim() {
     // An unclosed raw-text element declines.
     declined("<script>\nvar x = 1;\n");
 }
+
+#[test]
+fn multi_line_span_element_opens_a_paragraph() {
+    // A span-level element (`<em>`, `<small>`, …) at column 0 is NOT an HTML
+    // block: it opens a paragraph whose content — including the closing tag on
+    // its own line — is parsed as markdown spans and wrapped in `<p>`. The
+    // closing-tag line must not be mistaken for a new HTML block.
+    ok(
+        "<em>\nsome *text* and [a](/u)\n</em>\n",
+        "<p><em>\nsome <em>text</em> and <a href=\"/u\">a</a>\n</em></p>\n",
+    );
+    ok(
+        "<small>\nfine print [here](/x)\n</small>\n",
+        "<p><small>\nfine print <a href=\"/x\">here</a>\n</small></p>\n",
+    );
+}

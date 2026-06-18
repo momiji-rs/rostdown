@@ -12,7 +12,10 @@
 //! kramdown's harness runs cases without an `.options` sidecar as
 //! `{auto_ids: false, footnote_nr: 1}` (test/test_files.rb:58) — i.e.
 //! kramdown defaults plus auto_ids off, which is `Options::core()`.
-//! Cases WITH an `.options` sidecar are skipped (non-default options).
+//! Cases WITH a per-file `.options` sidecar OR a directory-level `options`
+//! file (kramdown applies both; e.g. `html_to_native/options` sets
+//! `html_to_native: true`) are skipped — those request non-default options
+//! rostdown doesn't implement, so they are out of scope, not failures.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -76,8 +79,14 @@ fn corpus_right_or_declined() {
         let tally = by_dir.entry(dir).or_default();
         tally.total += 1;
 
-        // Non-default options or no expected-HTML pair: out of scope.
-        if text_path.with_extension("options").exists() {
+        // Non-default options or no expected-HTML pair: out of scope. kramdown
+        // honors both a per-file `.options` sidecar and a directory-level
+        // `options` file (e.g. `html_to_native/options`), so skip either.
+        if text_path.with_extension("options").exists()
+            || text_path
+                .parent()
+                .is_some_and(|d| d.join("options").exists())
+        {
             tally.skipped += 1;
             continue;
         }

@@ -1861,6 +1861,7 @@ fn decline_block_scan(line: &str) -> Result<(), Error> {
             .get(1)
             .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'/' || *c == b'!' || *c == b'?')
         && !crate::html_block::starts_span_element(t)
+        && !crate::html_block::starts_span_element_close(t)
     {
         return Err(declined("html-block"));
     }

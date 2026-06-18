@@ -124,6 +124,27 @@ pub(crate) fn starts_span_element(line: &str) -> bool {
     leading_tag_name(line).is_some_and(|n| is_inline(&n) && !is_void(&n))
 }
 
+/// Whether `line` begins with the CLOSING tag of a span-level element
+/// (`</em>`, `</a>`, `</small>`, …). When a span element opens a paragraph
+/// across several lines, its closing tag lands at the start of a continuation
+/// line — that line is inline content of the paragraph, not a new HTML block,
+/// so the paragraph scanner must NOT decline it.
+pub(crate) fn starts_span_element_close(line: &str) -> bool {
+    let b = line.as_bytes();
+    if b.first() != Some(&b'<') || b.get(1) != Some(&b'/') {
+        return false;
+    }
+    let mut j = 2;
+    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-') {
+        j += 1;
+    }
+    if j == 2 {
+        return false;
+    }
+    let name = line[2..j].to_ascii_lowercase();
+    is_inline(&name) && !is_void(&name)
+}
+
 struct Parser<'a> {
     b: &'a [u8],
     s: &'a str,
