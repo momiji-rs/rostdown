@@ -809,12 +809,12 @@ fn parse_blocks<'a>(
         // with NO pipe can be neither a table row nor a pipe-decline, so one
         // memchr here skips both the table parse and the decline scan below.
         let line_has_pipe = line.as_bytes().contains(&b'|');
-        if line_has_pipe {
-            if let Some((kind, consumed)) = try_parse_table(ast, lines, i, opts)? {
-                emit_block!(kind);
-                i += consumed;
-                continue;
-            }
+        if line_has_pipe
+            && let Some((kind, consumed)) = try_parse_table(ast, lines, i, opts)?
+        {
+            emit_block!(kind);
+            i += consumed;
+            continue;
         }
 
         // A raw HTML block opening (column 0) with a block-level element. We
@@ -2019,46 +2019,32 @@ fn decline_block_scan(line: &str, allow_indented: bool) -> Result<(), Error> {
         return Err(declined("indented-code"));
     }
     let t = trim_start_ws(line);
-    // NOTE: the table-trigger pipe check is NOT here — kramdown only makes a
-    // table when EVERY line of the block is a row, so a lone pipe line is a
-    // paragraph. Callers that need the decline (list-item content, where
-    // kramdown tables a pipe inside the `<li>`) check `has_table_pipe`
-    // explicitly; the block loop routes a non-table pipe block to the
-    // paragraph path instead.
-    if t.starts_with("{:") || t.starts_with("{::") {
-        return Err(declined("ald-ial-extension"));
-    }
-    if t.starts_with("[^") {
-        return Err(declined("footnote"));
-    }
-    if t.starts_with("*[") {
-        return Err(declined("abbreviation"));
-    }
-    if t.starts_with("$$") {
-        return Err(declined("math"));
-    }
-    if t == "^" {
-        return Err(declined("eob-marker"));
-    }
-    if t.starts_with(": ") || t == ":" {
-        return Err(declined("definition-list"));
-    }
-    // Block-level link reference definitions are lifted out in a pre-pass
-    // (see collect_link_defs); a `[id]: url`-looking line that reaches here
-    // is mid-paragraph and stays literal text, exactly as in kramdown.
-    // Raw HTML blocks (a line opening with a tag). A line that opens with a
-    // SPAN-level element (`<em>`, `<a>`, `<code>`, …) is NOT an HTML block in
-    // kramdown — it starts a paragraph whose span parser re-serializes the
-    // element — so let it fall through to the paragraph path.
-    let bytes = t.as_bytes();
-    if bytes.first() == Some(&b'<')
-        && bytes
-            .get(1)
-            .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'/' || *c == b'!' || *c == b'?')
-        && !crate::html_block::starts_span_element(t)
-        && !crate::html_block::starts_span_element_close(t)
-    {
-        return Err(declined("html-block"));
+    // Dispatch on the first byte: each out-of-subset block opener has a
+    // distinct lead char, so ordinary prose (a letter/digit) skips every check
+    // via the `_` arm — this runs per paragraph line, so the fast path matters.
+    // (The table-trigger pipe check is NOT here — a lone pipe line is a
+    // paragraph; callers that table a pipe inside a `<li>` check it explicitly.
+    // A `[id]: url` link def was lifted out in a pre-pass. A SPAN-level element
+    // `<em>`/`<a>`/… opens a paragraph, not an HTML block, so it falls through.)
+    let b = t.as_bytes();
+    match b.first() {
+        Some(b'{') if t.starts_with("{:") => return Err(declined("ald-ial-extension")),
+        Some(b'[') if t.starts_with("[^") => return Err(declined("footnote")),
+        Some(b'*') if t.starts_with("*[") => return Err(declined("abbreviation")),
+        Some(b'$') if t.starts_with("$$") => return Err(declined("math")),
+        Some(b'^') if t == "^" => return Err(declined("eob-marker")),
+        Some(b':') if t.starts_with(": ") || t == ":" => {
+            return Err(declined("definition-list"));
+        }
+        Some(b'<')
+            if b.get(1)
+                .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'/' || *c == b'!' || *c == b'?')
+                && !crate::html_block::starts_span_element(t)
+                && !crate::html_block::starts_span_element_close(t) =>
+        {
+            return Err(declined("html-block"));
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -3573,7 +3559,9 @@ fn looks_like_link_def(line: &str) -> bool {
 /// it as a literal paragraph instead would be byte-wrong.
 fn collect_link_defs<'a>(lines: &[&'a str]) -> Result<(LinkDefs<'a>, Vec<bool>), Error> {
     let mut map: LinkDefs<'a> = HashMap::new();
-    let mut mask = vec![false; lines.len()];
+    // The mask (and map) stay empty — no allocation — until the FIRST link
+    // definition is found. The common doc has none, so this is the hot path.
+    let mut mask: Vec<bool> = Vec::new();
     let mut at_boundary = true;
     for (idx, &line) in lines.iter().enumerate() {
         if is_blank(line) {
@@ -3582,6 +3570,9 @@ fn collect_link_defs<'a>(lines: &[&'a str]) -> Result<(LinkDefs<'a>, Vec<bool>),
         }
         if at_boundary {
             if let Some((id, url, title)) = parse_link_def(line) {
+                if mask.is_empty() {
+                    mask = vec![false; lines.len()];
+                }
                 map.entry(id).or_insert((url, title)); // first definition wins
                 mask[idx] = true;
                 continue; // stay at a boundary: consecutive defs all count
