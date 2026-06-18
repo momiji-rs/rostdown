@@ -1263,7 +1263,14 @@ fn parse_blocks<'a>(
             if is_blank(l) {
                 break;
             }
-            if opts.gfm
+            // A continuation line beginning with an ASCII letter can't open a
+            // block, be an IAL, or be indented code — so it neither interrupts
+            // the paragraph nor declines. Skip those probes (the setext
+            // look-ahead and the contiguity / hard-break bookkeeping below
+            // still run). This is the common prose line, so the bail matters.
+            let letter_first = matches!(l.as_bytes().first(), Some(b'a'..=b'z' | b'A'..=b'Z'));
+            if !letter_first
+                && opts.gfm
                 && !first
                 && (l.starts_with('#')
                     || l.starts_with('>')
@@ -1279,7 +1286,7 @@ fn parse_blocks<'a>(
             }
             // A block IAL line ends the paragraph; the main loop then
             // attaches its attributes to this paragraph.
-            if !first {
+            if !letter_first && !first {
                 let lt = l.trim_start_matches([' ', '\t']);
                 if lt.starts_with("{:")
                     && !lt.starts_with("{::")
@@ -1293,10 +1300,10 @@ fn parse_blocks<'a>(
             // mis-render (`***` → emphasis decline already; `___`/`---`
             // runs likewise) — anything else opener-shaped is rare
             // enough to decline rather than risk divergence.
-            if !first && !opts.gfm && (l.starts_with('>') || list_marker(l).is_some()) {
+            if !letter_first && !first && !opts.gfm && (l.starts_with('>') || list_marker(l).is_some()) {
                 return Err(declined("core-paragraph-swallow"));
             }
-            if !first && opt_space_opener(l, opts) {
+            if !letter_first && !first && opt_space_opener(l, opts) {
                 // GFM's paragraph_end includes (OPT_SPACE-indented) list,
                 // blockquote, and fence starts — they interrupt the
                 // paragraph, so end it here and let the block loop parse the
@@ -1327,8 +1334,11 @@ fn parse_blocks<'a>(
             // A continuation line indented ≥4 spaces / tab is a lazy paragraph
             // continuation (kept verbatim), not indented code — only the first
             // line, which a real indented-code block would have claimed at the
-            // block loop, still rejects an indent here.
-            decline_block_scan(l, !first)?;
+            // block loop, still rejects an indent here. (A letter-first line
+            // has no indent and no out-of-subset opener, so it's skipped.)
+            if !letter_first {
+                decline_block_scan(l, !first)?;
+            }
             if first {
                 // First line: drop OPT_SPACE indent (a sub-slice move).
                 first_line = Some(&l[leading_spaces(l)..]);
