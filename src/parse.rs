@@ -3207,24 +3207,27 @@ fn parse_spans_until<'a>(
                 // become a `<br />` (kramdown), consuming exactly two
                 // spaces. Split the run at each such break; the `\n` itself
                 // stays as joined text. (The backslash form `\<nl>` is a
-                // trigger and is handled in the `\\` arm.)
+                // trigger and is handled in the `\\` arm.) Jump newline to
+                // newline with a word-at-a-time scan rather than re-walking
+                // the (already scanned by `next_trigger`) run byte by byte —
+                // a run with no `\n` (the common in-line case) bails in one
+                // SWAR pass.
                 let mut seg = start;
-                let mut p = start;
-                while p < run_end {
-                    if bytes[p] == b'\n' {
-                        let mut sp = 0;
-                        while p > start + sp && bytes[p - 1 - sp] == b' ' {
-                            sp += 1;
-                        }
-                        if sp >= 2 {
-                            acc.push_verbatim(seg, p - 2);
-                            acc.flush(ast, &mut chain);
-                            let br = ast.push_span(SpanKind::Raw(Cow::Borrowed("<br />")));
-                            chain.link(br, |q, n| ast.spans[q as usize].next = Some(n));
-                            seg = p; // drop the two spaces; keep the newline
-                        }
+                let mut search = start;
+                while let Some(off) = crate::scan::memchr1(&bytes[search..run_end], b'\n') {
+                    let nl = search + off;
+                    let mut sp = 0;
+                    while nl > start + sp && bytes[nl - 1 - sp] == b' ' {
+                        sp += 1;
                     }
-                    p += 1;
+                    if sp >= 2 {
+                        acc.push_verbatim(seg, nl - 2);
+                        acc.flush(ast, &mut chain);
+                        let br = ast.push_span(SpanKind::Raw(Cow::Borrowed("<br />")));
+                        chain.link(br, |q, n| ast.spans[q as usize].next = Some(n));
+                        seg = nl; // drop the two spaces; keep the newline
+                    }
+                    search = nl + 1;
                 }
                 acc.push_verbatim(seg, run_end);
                 prev = text[seg..run_end].chars().next_back();
