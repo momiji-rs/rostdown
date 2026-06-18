@@ -132,10 +132,16 @@ fn span_element_at_block_start_is_a_paragraph() {
         "<a href=\"/x\">**link**</a> then text\n",
         "<p><a href=\"/x\"><strong>link</strong></a> then text</p>\n",
     );
-    // A bare void block opener (`<hr>`/`<br>`) is NOT a span paragraph in
-    // kramdown (`<hr>` is a block element), so we decline rather than wrap it.
+    // A VOID span element (`<br>`/`<img>`/`<input>`, in kramdown's
+    // `HTML_SPAN_ELEMENTS`) at column 0 opens a paragraph too.
+    ok("<br>\ntext\n", "<p><br />\ntext</p>\n");
+    ok(
+        "<img src=\"a.png\" alt=\"x\" />\n",
+        "<p><img src=\"a.png\" alt=\"x\" /></p>\n",
+    );
+    // `<hr>` is a BLOCK-level void element, not a span paragraph — out of
+    // subset (a bare `<hr>` is an HR block in kramdown), so we decline.
     declined("<hr>\ntext\n");
-    declined("<br>\ntext\n");
     // An unclosed span at block start auto-closes in kramdown; out of subset.
     declined("<em>unclosed\nmore\n");
 }

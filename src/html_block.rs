@@ -121,7 +121,13 @@ pub(crate) fn starts_html_block(line: &str) -> bool {
 /// excluded: some (`<hr>`) are block-level in kramdown (a bare `<hr>` is an
 /// HR block, not a `<p>`-wrapped span), so declining them stays safe.
 pub(crate) fn starts_span_element(line: &str) -> bool {
-    leading_tag_name(line).is_some_and(|n| is_inline(&n) && !is_void(&n))
+    leading_tag_name(line).is_some_and(|n| {
+        // Non-void inline elements, plus the VOID elements kramdown classifies
+        // as span-level (`br`/`img`/`input` — in `HTML_SPAN_ELEMENTS`, so they
+        // open a `<p>` at column 0; `hr`/`link`/`meta`/… are block-level void
+        // and stay out of this paragraph path).
+        (is_inline(&n) && !is_void(&n)) || matches!(n.as_str(), "br" | "img" | "input")
+    })
 }
 
 /// Whether `line` begins with the CLOSING tag of a span-level element
