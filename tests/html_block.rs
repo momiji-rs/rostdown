@@ -178,6 +178,20 @@ fn html_comment_blocks_render_verbatim() {
 }
 
 #[test]
+fn leading_block_ial_attaches_to_html_block() {
+    // A block IAL on the line above an HTML block injects its attributes into
+    // the block's root tag (kramdown attaches the IAL to the element).
+    ok(
+        "{: style=\"text-align: center\"}\n<p>hi</p>\n",
+        "<p style=\"text-align: center\">hi</p>\n",
+    );
+    ok("{:.note}\n<div>x</div>\n", "<div class=\"note\">x</div>\n");
+    // Merging an IAL onto an element that already has attributes (class
+    // accumulation / key override) is out of subset — decline.
+    declined("{:.b}\n<div class=\"a\">x</div>\n");
+}
+
+#[test]
 fn multi_line_span_element_opens_a_paragraph() {
     // A span-level element (`<em>`, `<small>`, …) at column 0 is NOT an HTML
     // block: it opens a paragraph whose content — including the closing tag on

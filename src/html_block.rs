@@ -18,6 +18,8 @@
 //! instructions, a `markdown=` attribute, and any malformed / unclosed /
 //! mismatched structure all bail to `None`.
 
+use std::borrow::Cow;
+
 /// kramdown `HTML_ELEMENTS_WITHOUT_BODY` — serialized ` />`, no close tag.
 fn is_void(name: &str) -> bool {
     matches!(
@@ -240,8 +242,10 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse and serialize one element at `pos` (`b[pos] == b'<'`, not a
-    /// close tag). `None` ⇒ out of subset.
-    fn element(&mut self, out: &mut String) -> Option<()> {
+    /// close tag). `None` ⇒ out of subset. `root_ial` is a leading block IAL
+    /// attaching to this (the outermost) element — its attributes are injected
+    /// into the open tag; nested elements always pass `&[]`.
+    fn element(&mut self, out: &mut String, root_ial: &[(Cow<'_, str>, String)]) -> Option<()> {
         debug_assert_eq!(self.peek(), Some(b'<'));
         self.pos += 1;
         // Comments / doctype / PI / CDATA / close-without-open: out of subset.
@@ -262,7 +266,24 @@ impl<'a> Parser<'a> {
 
         out.push('<');
         out.push_str(&name);
+        let attrs_mark = out.len();
         let self_closed = self.attributes(out)?;
+        // Inject a leading block IAL's attributes onto the root tag. We only
+        // support an element with NO attributes of its own (kramdown's IAL
+        // merge — class accumulation, key override — onto existing attributes
+        // is out of subset, so decline that).
+        if !root_ial.is_empty() {
+            if out.len() != attrs_mark {
+                return None;
+            }
+            for (k, v) in root_ial {
+                out.push(' ');
+                out.push_str(k);
+                out.push_str("=\"");
+                Self::push_escaped_attr(out, v);
+                out.push('"');
+            }
+        }
 
         if is_void(&name) || self_closed {
             out.push_str(" />");
@@ -338,7 +359,7 @@ impl<'a> Parser<'a> {
                     }
                     // `<` + letter starts a nested element; a malformed tag
                     // there declines (kramdown's recovery is out of subset).
-                    Some(c) if c.is_ascii_alphabetic() => self.element(out)?,
+                    Some(c) if c.is_ascii_alphabetic() => self.element(out, &[])?,
                     // A bare `<` not starting a tag (`a < b`, `<<`, `< 3`) is
                     // literal text — escape it, matching kramdown.
                     _ => {
@@ -584,7 +605,7 @@ pub(crate) fn inline_at(s: &str) -> Option<(Inline<'_>, usize)> {
             s,
             pos: 0,
         };
-        ep.element(&mut whole)?;
+        ep.element(&mut whole, &[])?;
         return Some((Inline::Raw(whole), ep.pos));
     }
     let mut open = String::with_capacity(name.len() + 8);
@@ -611,10 +632,13 @@ pub(crate) fn inline_at(s: &str) -> Option<(Inline<'_>, usize)> {
 /// column 0 with a block-start tag). Returns the serialized HTML and the
 /// number of bytes consumed, requiring the close tag to land at a line
 /// boundary (end of input or a `\n`). `None` ⇒ out of subset → decline.
-pub(crate) fn serialize(src: &str) -> Option<(String, usize)> {
+pub(crate) fn serialize(src: &str, root_ial: &[(Cow<'_, str>, String)]) -> Option<(String, usize)> {
     // An HTML comment block: kramdown keeps the content verbatim (no markdown,
     // no escaping) up to the first `-->`, which must end at a line boundary.
     if let Some(rest) = src.strip_prefix("<!--") {
+        if !root_ial.is_empty() {
+            return None; // a block IAL on a comment is out of subset
+        }
         let end = rest.find("-->")?;
         let close = "<!--".len() + end + "-->".len();
         if src[close..].starts_with(|c| c != '\n') {
@@ -632,7 +656,7 @@ pub(crate) fn serialize(src: &str) -> Option<(String, usize)> {
         pos: 0,
     };
     let mut out = String::with_capacity(src.len() + 16);
-    p.element(&mut out)?;
+    p.element(&mut out, root_ial)?;
     // The element must end exactly at a line boundary; trailing content on
     // the same line is out of subset.
     if p.pos != src.len() && src.as_bytes().get(p.pos) != Some(&b'\n') {
@@ -755,7 +779,7 @@ mod tests {
     }
 
     fn ser(s: &str) -> Option<String> {
-        serialize(s).map(|(h, _)| h)
+        serialize(s, &[]).map(|(h, _)| h)
     }
 
     #[test]

@@ -814,8 +814,12 @@ fn parse_blocks<'a>(
         // keep declining rather than mis-render.
         if opts.gfm && crate::html_block::starts_html_block(line) {
             let off = offset_in(src, line);
-            if let Some((html, consumed)) = crate::html_block::serialize(&src[off..]) {
+            // A buffered leading block IAL (`{: style=…}` on the line above)
+            // attaches to this HTML block — `serialize` injects it into the
+            // root tag, so consume it here rather than via `emit_block!`.
+            if let Some((html, consumed)) = crate::html_block::serialize(&src[off..], &pending_ial) {
                 let lines_used = 1 + src[off..off + consumed].bytes().filter(|&c| c == b'\n').count();
+                pending_ial.clear();
                 emit_block!(BlockKind::RawHtml(html));
                 i += lines_used;
                 continue;
@@ -1797,12 +1801,13 @@ fn line_starts_attachable_block(lines: &[&str], idx: usize) -> bool {
         return false;
     }
     let t = trim_start_ws(l);
-    if t.starts_with("{:") || is_hr(l) || crate::html_block::starts_html_block(l) {
+    if t.starts_with("{:") || is_hr(l) {
         return false;
     }
     // Heading / blockquote / list marker / plain paragraph — all attachable.
     // A pipe line is attachable too (becomes a `<table>`, or a paragraph if not
-    // a clean table); a fence is attachable (the IAL lands on `<pre>`).
+    // a clean table); a fence is attachable (the IAL lands on `<pre>`); a raw
+    // HTML block is attachable (`serialize` injects the IAL into its root tag).
     // `emit_block!` carries the pending IAL onto whichever block emits.
     true
 }
