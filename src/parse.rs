@@ -751,6 +751,11 @@ fn parse_blocks<'a>(
             emit_block!(BlockKind::Blank);
             continue;
         }
+        // A block-start beginning with an ASCII letter is not an HR, not
+        // indented code, and not an out-of-subset opener — so the
+        // `is_hr`/`decline_block_scan` probes (each does a trim) just say no.
+        // Most paragraphs start this way, so the bail is worth a byte test.
+        let line_starts_letter = matches!(line.as_bytes().first(), Some(b'a'..=b'z' | b'A'..=b'Z'));
 
         // A block IAL line (`{:.class}` …) immediately after a paragraph,
         // heading, or list attaches its attributes to that block. Span
@@ -915,7 +920,9 @@ fn parse_blocks<'a>(
             continue;
         }
 
-        decline_block_scan(line, false)?;
+        if !line_starts_letter {
+            decline_block_scan(line, false)?;
+        }
 
         // ATX heading.
         if let Some(rest) = line.strip_prefix('#') {
@@ -996,7 +1003,7 @@ fn parse_blocks<'a>(
 
         // Horizontal rule: 3+ of the same marker, only that marker +
         // spaces on the line.
-        if is_hr(line) {
+        if !line_starts_letter && is_hr(line) {
             emit_block!(BlockKind::Hr);
             i += 1;
             continue;
