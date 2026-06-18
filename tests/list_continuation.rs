@@ -131,11 +131,13 @@ fn indented_opt_space_lists() {
         "  1. x\n  2. y\n",
         "<ol>\n  <li>x</li>\n  <li>y</li>\n</ol>\n",
     );
-    // …but a lazy continuation in an opt-space list whose own leading
-    // whitespace the base de-indent would erase declines: kramdown keeps a
-    // lazy line verbatim (`item\n cont`), and the de-indent would drop the
-    // space. An indented continuation (residual space kept) still renders.
-    declined(" - item one\n as part two\n");
+    // A lazy continuation in an opt-space list keeps its FULL leading
+    // whitespace verbatim (kramdown does not strip a lazy line), so a 1-space
+    // residual survives — the base-aware parse reproduces it exactly.
+    ok(
+        " - item one\n as part two\n",
+        "<ul>\n  <li>item one\n as part two</li>\n</ul>\n",
+    );
     ok(
         " - item one\n   indented cont\n",
         "<ul>\n  <li>item one\nindented cont</li>\n</ul>\n",
@@ -203,10 +205,18 @@ fn balanced_brackets_in_continuation_still_ok() {
 
 #[test]
 fn declines_irregular_indentation() {
-    // 1-space indent (kramdown reads it as a same-level item).
-    declined("- a\n b\n");
+    // A 1-space-indented MARKER is a same-level sibling kramdown keeps but we
+    // don't model (off the list's own indent).
+    declined("- a\n - b\n");
     // Tab indentation.
     declined("- a\n\tb\n");
+}
+
+#[test]
+fn shallow_lazy_continuation_keeps_its_indent() {
+    // A 1-space-indented PLAIN continuation is a lazy line; kramdown keeps its
+    // full leading space (it is not a content line, so not stripped).
+    ok("- a\n b\n", "<ul>\n  <li>a\n b</li>\n</ul>\n");
 }
 
 #[test]
@@ -218,4 +228,24 @@ fn trailing_whitespace_across_a_continuation_is_a_hard_break() {
         "- a  \n  b\n",
         "<ul>\n  <li>a<br />\nb</li>\n</ul>\n",
     );
+}
+
+#[test]
+fn loose_list_uniform_multiblock_renders() {
+    // A loose list whose items are all paragraph-only (one multi-paragraph
+    // item among single-paragraph siblings, every item blank-separated)
+    // renders uniformly — every item's paragraphs wrapped in `<p>`.
+    ok(
+        "- a\n\n  more\n\n- b\n",
+        "<ul>\n  <li>\n    <p>a</p>\n\n    <p>more</p>\n  </li>\n  <li>\n    <p>b</p>\n  </li>\n</ul>\n",
+    );
+}
+
+#[test]
+fn loose_list_with_non_paragraph_item_declines() {
+    // A loose list that ALSO has an item carrying a non-paragraph block (code,
+    // nested list) triggers kramdown's per-item tight/loose mixing — out of
+    // subset, declines.
+    declined("1. a\n\n2. b\n   ```\n   x\n   ```\n");
+    declined("1. a\n\n2. b\n   * x\n");
 }

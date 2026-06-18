@@ -938,7 +938,7 @@ fn parse_blocks<'a>(
         // (their content column is digits+2, not a fixed strip
         // width).
         if let Some(ordered) = list_marker(line) {
-            let (items, loose) = parse_list_items(ast, src, lines, &mut i, ordered, opts)?;
+            let (items, loose) = parse_list_items(ast, src, lines, &mut i, ordered, 0, opts)?;
             emit_block!(BlockKind::List {
                 ordered,
                 loose,
@@ -947,43 +947,21 @@ fn parse_blocks<'a>(
             continue;
         }
 
-        // A list behind a 1–3-space OPT_SPACE base: kramdown ignores the
-        // small indent. De-indent the run by the base column (the stripped
-        // suffixes still borrow `src`) and parse it as a column-0 list,
-        // then skip the lines it consumed.
+        // A list behind a 1–3-space OPT_SPACE base: kramdown ignores the small
+        // indent. `parse_list_items` parses it in place at that base — markers
+        // and content at `base`+, lazy lines keeping their full indent — so a
+        // lazy continuation's residual leading space is preserved verbatim
+        // (the flat-de-indent approach used to drop it).
         let base = line.len() - line.trim_start_matches(' ').len();
         if (1..=3).contains(&base)
             && let Some(ordered) = list_marker(&line[base..])
         {
-            let pad = &"   "[..base];
-            let deindented: Vec<&str> = lines[i..]
-                .iter()
-                .map(|l| l.strip_prefix(pad).unwrap_or(l))
-                .collect();
-            let mut k = 0;
-            let (items, loose) = parse_list_items(ast, src, &deindented, &mut k, ordered, opts)?;
-            // The blanket base de-indent also strips a lazy continuation's
-            // OWN leading whitespace, but kramdown keeps a lazy line (indent
-            // below the item's content column) verbatim. Where a consumed
-            // non-marker line had leading space that the de-indent erased,
-            // our parse would drop it — decline rather than emit a space-off
-            // line. (Indented continuations keep a residual space; markers
-            // are structural; both are fine.)
-            if (0..k).any(|n| {
-                let de = deindented[n];
-                !is_blank(de)
-                    && list_marker(de).is_none()
-                    && lines[i + n].starts_with(' ')
-                    && !de.starts_with(' ')
-            }) {
-                return Err(declined("opt-space-list-continuation"));
-            }
+            let (items, loose) = parse_list_items(ast, src, lines, &mut i, ordered, base, opts)?;
             emit_block!(BlockKind::List {
                 ordered,
                 loose,
                 items
             });
-            i += k;
             continue;
         }
 
@@ -1765,13 +1743,11 @@ fn parse_list_items<'a>(
     lines: &[&'a str],
     i: &mut usize,
     ordered: bool,
+    base: usize,
     opts: &Options,
 ) -> Result<(Option<u32>, bool), Error> {
     let mut items = Chain::new();
     let mut item_idxs: Vec<u32> = Vec::new();
-    // `loose`: an item is blank-separated from the next, or itself spans a
-    // blank between blocks. `tight_adjacent`: some pair abuts with no blank.
-    // A list mixing both renders per-item in kramdown — out of subset.
     let mut loose = false;
     // `between_loose`: looseness came from a blank line BETWEEN two items (vs
     // an internal blank inside one item). Only this kind, combined with a
@@ -1779,6 +1755,12 @@ fn parse_list_items<'a>(
     let mut between_loose = false;
     let mut tight_adjacent = false;
     let mut via_blank = false;
+    // A line opens an item of THIS list when its marker sits at exactly the
+    // list's own indent `base` (0 for a column-0 list, 1–3 under OPT_SPACE).
+    let is_item_start = |l: &str| {
+        let ind = l.len() - l.trim_start_matches(' ').len();
+        ind == base && list_marker(&l[base..]) == Some(ordered)
+    };
     while *i < lines.len() {
         let l = lines[*i];
         if is_blank(l) {
@@ -1786,17 +1768,15 @@ fn parse_list_items<'a>(
             while j < lines.len() && is_blank(lines[j]) {
                 j += 1;
             }
-            // `* * *` looks like a marker but is a horizontal rule — ends the
-            // list. A blank then a sibling marker continues the list. kramdown
-            // makes it LOOSE only when the blank directly follows the previous
-            // item's PARAGRAPH content; a blank that follows the previous
-            // item's trailing nested sub-list is absorbed and stays tight
-            // (`- a\n  - x\n\n- b` is tight).
-            if j < lines.len() && list_marker(lines[j]) == Some(ordered) && !is_hr(lines[j]) {
-                let prev_ends_with_list = item_idxs
+            // A blank then a sibling marker continues the list. kramdown makes
+            // it LOOSE only when the blank directly follows the previous item's
+            // PARAGRAPH content; a blank that follows a trailing nested sub-list
+            // is absorbed and stays tight (`- a\n  - x\n\n- b` is tight).
+            if j < lines.len() && is_item_start(lines[j]) && !is_hr(lines[j]) {
+                let prev_absorbs = item_idxs
                     .last()
-                    .is_some_and(|&p| item_ends_with_list(ast, ast.items[p as usize].blocks));
-                if !prev_ends_with_list {
+                    .is_some_and(|&p| item_ends_with_absorbing_block(ast, ast.items[p as usize].blocks));
+                if !prev_absorbs {
                     loose = true;
                     between_loose = true;
                 }
@@ -1806,21 +1786,21 @@ fn parse_list_items<'a>(
             }
             break;
         }
-        if list_marker(l) == Some(ordered) {
+        if is_item_start(l) {
             if !item_idxs.is_empty() && !via_blank {
                 tight_adjacent = true;
             }
             via_blank = false;
-            let first = strip_marker(l, ordered);
+            let first = strip_marker(&l[base..], ordered);
+            // Absolute content column = base + marker width.
             let content_col = l.len() - first.len();
-            // Gather the item's content lines, de-indented by `content_col`.
             let mut content: Vec<&'a str> = vec![first];
             *i += 1;
             let mut internal_blank = false;
-            // Once a shallow-indented (< content_col) nested marker is kept
-            // verbatim, a later line at the full content column would be
-            // de-indented on a different basis (kramdown splits the differing
-            // indents into separate lists) — ambiguous, so decline the mix.
+            // Once a shallow-indented (< content_col) line is kept verbatim, a
+            // later line at the full content column is de-indented on a
+            // different basis (kramdown splits the differing indents into
+            // separate lists) — ambiguous, so decline the mix.
             let mut saw_shallow = false;
             while *i < lines.len() {
                 let cl = lines[*i];
@@ -1846,42 +1826,42 @@ fn parse_list_items<'a>(
                     return Err(declined("list-tab-indent"));
                 }
                 let lead = cl.len() - cl.trim_start_matches(' ').len();
+                let trimmed = &cl[lead..];
                 if lead >= content_col {
+                    // Content line: strip the content column (a deeper indent
+                    // keeps its residual spaces, like kramdown).
                     if saw_shallow {
                         return Err(declined("list-continuation"));
                     }
                     content.push(&cl[content_col..]);
                     *i += 1;
-                } else if lead == 0 && list_marker(cl) == Some(ordered) {
-                    break; // next sibling item
-                } else if lead == 0 && !cl.starts_with("{:") {
-                    // Column-0 lazy continuation: kramdown is aggressively lazy
-                    // — it joins a plain line onto the item's open paragraph and
-                    // even pulls a column-0 block (heading/quote/code) into the
-                    // DEEPEST open item. Collect it; the recursive parse builds
-                    // the right structure and the tight-shape check declines the
-                    // shapes we can't render.
+                } else if list_marker(trimmed) == Some(ordered) {
+                    // A same-kind marker shallower than the content column is a
+                    // sibling only at the list's own indent (kramdown's
+                    // fetch_pattern allows 0..content_col-1); off that indent it
+                    // is out of our clean subset.
+                    if lead == base {
+                        break; // next sibling item
+                    }
+                    return Err(declined("list-continuation"));
+                } else if lead == base && trimmed.starts_with("{:") && !trimmed.starts_with("{::") {
+                    break; // a block IAL at the list indent ends the list
+                } else if lead == 0 {
+                    // Column-0 lazy continuation: kramdown joins a plain line
+                    // onto the item's open paragraph and even pulls a column-0
+                    // block into the DEEPEST open item. Collect it; the
+                    // recursive parse builds the right structure.
                     content.push(cl);
                     *i += 1;
-                } else if lead == 0 {
-                    break; // a column-0 `{:` block IAL ends the list
-                } else if list_marker(trim_start_ws(cl)) == Some(!ordered) {
-                    // A shallow-indented (1..content_col) marker of the OPPOSITE
-                    // kind is a lazy continuation in kramdown: kept VERBATIM
-                    // (leading spaces intact), then re-parsed as an OPT_SPACE
-                    // nested list (`1. a:\n  * b` → `<li>a:<ul>…`). A same-kind
-                    // shallow marker is a same-level sibling (`- a\n - b` is
-                    // flat) and varying shallow indents split into separate
-                    // lists — both out of subset, so they fall to the decline.
+                } else {
+                    // Shallow lazy line (1..content_col): a plain paragraph
+                    // continuation OR an opposite-kind nested marker — kramdown
+                    // KEEPS its full leading indent (it is not a content line),
+                    // so push it verbatim and let the recursive parse handle it
+                    // (paragraph join / OPT_SPACE nested list).
                     content.push(cl);
                     saw_shallow = true;
                     *i += 1;
-                } else {
-                    // A shallow-indented plain line is a lazy paragraph
-                    // continuation whose residual leading space kramdown keeps
-                    // but our flat de-indent can't reproduce; a same-kind
-                    // shallow marker is ambiguous — decline either way.
-                    return Err(declined("list-continuation"));
                 }
             }
             if internal_blank {
@@ -1899,7 +1879,8 @@ fn parse_list_items<'a>(
             items.link(idx, |p, n| ast.items[p as usize].next = Some(n));
             item_idxs.push(idx);
         } else if l.starts_with(' ') {
-            // A 1-space marker is a SAME-level item in kramdown; decline.
+            // A marker/line indented off the list's base (e.g. a 1-space marker
+            // at column 0, a same-level item kramdown keeps but we don't model).
             return Err(declined("list-continuation"));
         } else if list_marker(l).is_some() {
             return Err(declined("mixed-list-markers"));
@@ -1913,19 +1894,20 @@ fn parse_list_items<'a>(
         return Err(declined("mixed-loose-tight-list"));
     }
     // When looseness comes from a blank BETWEEN items and the list ALSO holds
-    // an item ending in a nested sub-list, kramdown switches to PER-ITEM
-    // tight/loose (the sub-list item and the trailing item stay inline) — a
-    // shape our single loose flag can't reproduce, so decline. (Looseness from
-    // an internal blank inside a single item renders fine and is not caught.)
+    // an item that is NOT a single paragraph, kramdown switches to PER-ITEM
+    // tight/loose (a sub-list / code / trailing paragraph stays inline while a
+    // bare paragraph item wraps in `<p>`) — a shape our single loose flag
+    // can't reproduce, so decline.
     if between_loose
-        && item_idxs.iter().any(|&p| item_ends_with_list(ast, ast.items[p as usize].blocks))
+        && item_idxs
+            .iter()
+            .any(|&p| !item_is_all_paragraphs(ast, ast.items[p as usize].blocks))
     {
         return Err(declined("list-loose-mixed"));
     }
     // Tight items render inline (`<li>text</li>`) or as `<li>text\n<ul>…`. Only
-    // a single paragraph, a paragraph followed by nested list(s), or a single
-    // non-paragraph block (a pipe-table / code) have a defined inline shape;
-    // any richer tight shape is out of subset.
+    // a leading paragraph (+ trailing blocks) or a single non-paragraph block
+    // has a defined inline shape; any richer tight shape is out of subset.
     if !loose {
         for &idx in &item_idxs {
             if !tight_item_shape_ok(ast, ast.items[idx as usize].blocks) {
@@ -1936,18 +1918,38 @@ fn parse_list_items<'a>(
     Ok((items.first(), loose))
 }
 
-/// Whether the item's block chain ends in a nested list. kramdown absorbs a
-/// blank line that follows such a trailing sub-list, so it does NOT make the
-/// outer list loose (`- a\n  - x\n\n- b` stays tight).
-fn item_ends_with_list(ast: &Ast<'_>, blocks: Option<u32>) -> bool {
+/// Whether the item's block chain ends in a nested list or a code block —
+/// kramdown absorbs a blank line that follows one of those, so it does NOT
+/// make the outer list loose (`- a\n  - x\n\n- b` and the same with a trailing
+/// fenced code stay tight; a trailing blockquote or paragraph does loosen).
+fn item_ends_with_absorbing_block(ast: &Ast<'_>, blocks: Option<u32>) -> bool {
     let mut cur = blocks;
-    let mut last_is_list = false;
+    let mut absorbing = false;
     while let Some(b) = cur {
         let node = &ast.blocks[b as usize];
-        last_is_list = matches!(node.kind, BlockKind::List { .. });
+        absorbing = matches!(node.kind, BlockKind::List { .. } | BlockKind::Code { .. });
         cur = node.next;
     }
-    last_is_list
+    absorbing
+}
+
+/// Whether the item's content is only paragraphs (and the blank-run nodes
+/// between them). A LOOSE list (blank between items) renders UNIFORMLY — every
+/// item's paragraphs wrapped in `<p>` — as long as every item is paragraph-
+/// only (a multi-paragraph item is fine); but if any item carries a
+/// non-paragraph block (a nested list, fenced code, …) kramdown switches to
+/// its per-item tight/loose mixing (that block's leading text stays inline),
+/// which our single loose flag can't reproduce.
+fn item_is_all_paragraphs(ast: &Ast<'_>, blocks: Option<u32>) -> bool {
+    let mut cur = blocks;
+    while let Some(b) = cur {
+        let node = &ast.blocks[b as usize];
+        if !matches!(node.kind, BlockKind::Para(_) | BlockKind::Blank) {
+            return false;
+        }
+        cur = node.next;
+    }
+    true
 }
 
 /// A tight list item renders inline only for these shapes: a leading
