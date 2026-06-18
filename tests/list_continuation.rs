@@ -242,10 +242,27 @@ fn loose_list_uniform_multiblock_renders() {
 }
 
 #[test]
-fn loose_list_with_non_paragraph_item_declines() {
-    // A loose list that ALSO has an item carrying a non-paragraph block (code,
-    // nested list) triggers kramdown's per-item tight/loose mixing — out of
-    // subset, declines.
+fn loose_list_with_abutting_block_declines() {
+    // In a loose list, an item whose leading paragraph DIRECTLY ABUTS a block
+    // (no blank line between `b` and the code / sub-list) makes kramdown render
+    // that paragraph transparent (inline) while its siblings wrap in `<p>` —
+    // per-item tight/loose mixing our single loose flag can't reproduce, so we
+    // decline.
     declined("1. a\n\n2. b\n   ```\n   x\n   ```\n");
     declined("1. a\n\n2. b\n   * x\n");
+}
+
+#[test]
+fn loose_list_with_blank_separated_block_renders() {
+    // The same shapes but with a BLANK LINE between the paragraph and the
+    // following block keep the leading paragraph loose (wrapped in `<p>`), so
+    // the whole list stays uniformly loose and renders byte-identically.
+    ok(
+        "1. a\n\n2. b\n\n   ```\n   x\n   ```\n",
+        "<ol>\n  <li>\n    <p>a</p>\n  </li>\n  <li>\n    <p>b</p>\n\n    <pre><code>x\n</code></pre>\n  </li>\n</ol>\n",
+    );
+    ok(
+        "1. a\n\n2. b\n\n   * x\n",
+        "<ol>\n  <li>\n    <p>a</p>\n  </li>\n  <li>\n    <p>b</p>\n\n    <ul>\n      <li>x</li>\n    </ul>\n  </li>\n</ol>\n",
+    );
 }
