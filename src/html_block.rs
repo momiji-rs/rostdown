@@ -110,7 +110,7 @@ fn leading_tag_name(line: &str) -> Option<String> {
 /// element. Used by the paragraph scanner to break before an HTML block and
 /// by the block loop to dispatch into [`serialize`].
 pub(crate) fn starts_html_block(line: &str) -> bool {
-    leading_tag_name(line).is_some_and(|n| is_block_start(&n))
+    line.starts_with("<!--") || leading_tag_name(line).is_some_and(|n| is_block_start(&n))
 }
 
 /// Whether `line` begins with a NON-VOID span-level HTML element — `<em>`,
@@ -612,6 +612,16 @@ pub(crate) fn inline_at(s: &str) -> Option<(Inline<'_>, usize)> {
 /// number of bytes consumed, requiring the close tag to land at a line
 /// boundary (end of input or a `\n`). `None` ⇒ out of subset → decline.
 pub(crate) fn serialize(src: &str) -> Option<(String, usize)> {
+    // An HTML comment block: kramdown keeps the content verbatim (no markdown,
+    // no escaping) up to the first `-->`, which must end at a line boundary.
+    if let Some(rest) = src.strip_prefix("<!--") {
+        let end = rest.find("-->")?;
+        let close = "<!--".len() + end + "-->".len();
+        if src[close..].starts_with(|c| c != '\n') {
+            return None; // trailing content on the close line is out of subset
+        }
+        return Some((src[..close].to_string(), close));
+    }
     // Must open with a block-start element.
     if !starts_html_block(src) {
         return None;
@@ -738,7 +748,7 @@ mod tests {
         assert!(starts_html_block("<table>")); // table family re-serialized
         assert!(!starts_html_block("<span>x</span>")); // span not a block start
         assert!(!starts_html_block("<code>x</code>")); // code is span/inline
-        assert!(!starts_html_block("<!-- c -->")); // comment
+        assert!(starts_html_block("<!-- c -->")); // comment is a block
         assert!(!starts_html_block("not a tag"));
         assert!(!starts_html_block("<")); // bare
         assert!(!starts_html_block(" <div>")); // leading space → handled elsewhere
@@ -795,8 +805,20 @@ mod tests {
     }
 
     #[test]
+    fn serialize_comments() {
+        // Comment content kept verbatim up to the first `-->`.
+        assert_eq!(ser("<!-- c -->").as_deref(), Some("<!-- c -->"));
+        assert_eq!(
+            ser("<!--\nmulti\nline\n-->").as_deref(),
+            Some("<!--\nmulti\nline\n-->")
+        );
+        assert_eq!(ser("<!---\n## x\n-->").as_deref(), Some("<!---\n## x\n-->"));
+        assert_eq!(ser("<!-- unterminated"), None); // no closing -->
+        assert_eq!(ser("<!-- c --> trailing"), None); // content after close
+    }
+
+    #[test]
     fn serialize_declines() {
-        assert_eq!(ser("<!-- c -->"), None); // comment
         assert_eq!(ser("<div markdown=\"1\">x</div>"), None); // markdown attr
         assert_eq!(ser("<div>unclosed"), None); // no close
         assert_eq!(ser("<div>a</div> trailing"), None); // trailing content

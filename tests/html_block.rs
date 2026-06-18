@@ -133,7 +133,6 @@ fn table_family_reserialized() {
 
 #[test]
 fn out_of_subset_declines() {
-    declined("<!-- a comment -->\n"); // comment
     declined("<div markdown=\"1\">\n**b**\n</div>\n"); // markdown= changes parsing
     declined("<pre>\n  code\n</pre>\n"); // pre: bespoke whitespace rules
     declined("<div>unclosed\n"); // no close tag
@@ -159,6 +158,23 @@ fn raw_text_script_and_style_render_verbatim() {
     );
     // An unclosed raw-text element declines.
     declined("<script>\nvar x = 1;\n");
+}
+
+#[test]
+fn html_comment_blocks_render_verbatim() {
+    // A comment block is kept verbatim (no markdown, no escaping) up to the
+    // first `-->`; surrounding paragraphs are unaffected.
+    ok("<!-- a comment -->\n", "<!-- a comment -->\n");
+    ok(
+        "<!--\n## not a heading\nverbatim\n-->\n",
+        "<!--\n## not a heading\nverbatim\n-->\n",
+    );
+    ok(
+        "text\n\n<!-- note -->\n\nmore\n",
+        "<p>text</p>\n\n<!-- note -->\n\n<p>more</p>\n",
+    );
+    // Content after the closing `-->` on the same line is out of subset.
+    declined("<!-- c --> trailing\n");
 }
 
 #[test]
