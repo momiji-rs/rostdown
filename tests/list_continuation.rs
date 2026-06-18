@@ -242,14 +242,40 @@ fn loose_list_uniform_multiblock_renders() {
 }
 
 #[test]
-fn loose_list_with_abutting_block_declines() {
-    // In a loose list, an item whose leading paragraph DIRECTLY ABUTS a block
-    // (no blank line between `b` and the code / sub-list) makes kramdown render
-    // that paragraph transparent (inline) while its siblings wrap in `<p>` —
-    // per-item tight/loose mixing our single loose flag can't reproduce, so we
-    // decline.
-    declined("1. a\n\n2. b\n   ```\n   x\n   ```\n");
-    declined("1. a\n\n2. b\n   * x\n");
+fn loose_list_abutting_block_at_end_stays_uniform() {
+    // An item whose leading paragraph directly abuts a block makes that
+    // paragraph "transparent" (inline) ONLY when kramdown's cross-item
+    // condition also holds. For the LAST item with no earlier transparent
+    // sibling that condition fails, so the list stays uniformly loose — every
+    // leading paragraph wrapped in `<p>`. Byte-identical to kramdown.
+    ok(
+        "1. a\n\n2. b\n   ```\n   x\n   ```\n",
+        "<ol>\n  <li>\n    <p>a</p>\n  </li>\n  <li>\n    <p>b</p>\n    <pre><code>x\n</code></pre>\n  </li>\n</ol>\n",
+    );
+    ok(
+        "1. a\n\n2. b\n   * x\n",
+        "<ol>\n  <li>\n    <p>a</p>\n  </li>\n  <li>\n    <p>b</p>\n    <ul>\n      <li>x</li>\n    </ul>\n  </li>\n</ol>\n",
+    );
+}
+
+#[test]
+fn loose_list_per_item_tight_loose_mixing_renders() {
+    // A MIDDLE item whose leading paragraph abuts a sub-list goes transparent
+    // (rendered inline, `<li>b`), while its bare-paragraph sibling stays loose
+    // (`<p>a</p>`). kramdown's cross-item condition then carries the
+    // transparency to the trailing item too (`<li>c`), so it renders inline
+    // even though it has no abutting block. We reproduce the whole fold
+    // byte-identically.
+    ok(
+        "1. a\n\n2. b\n   * x\n\n3. c\n",
+        "<ol>\n  <li>\n    <p>a</p>\n  </li>\n  <li>b\n    <ul>\n      <li>x</li>\n    </ul>\n  </li>\n  <li>c</li>\n</ol>\n",
+    );
+    // The FIRST item abutting a sub-list goes transparent (it is not the last
+    // item); its transparency then carries to the trailing bare item.
+    ok(
+        "1. a\n   * x\n\n2. b\n",
+        "<ol>\n  <li>a\n    <ul>\n      <li>x</li>\n    </ul>\n  </li>\n  <li>b</li>\n</ol>\n",
+    );
 }
 
 #[test]

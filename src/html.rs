@@ -338,9 +338,11 @@ fn emit_list(
     while let Some(idx) = cur {
         let item = &ast.items[idx as usize];
         cur = item.next;
-        // A tight item that is a leading paragraph (optionally followed by
-        // nested lists) renders inline; everything else renders in block form.
-        let para = (!loose)
+        // A leading paragraph renders inline (`<li>text…`) when the list is
+        // tight, or — in a loose list — when this item is "transparent"
+        // (kramdown's per-item tight/loose mixing); everything else renders in
+        // block form with the paragraph wrapped in `<p>`.
+        let para = (!loose || item.transparent)
             .then(|| match item.blocks {
                 Some(h) => match &ast.blocks[h as usize].kind {
                     BlockKind::Para(spans) => Some((*spans, ast.blocks[h as usize].next)),

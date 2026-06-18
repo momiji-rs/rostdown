@@ -184,6 +184,13 @@ pub(crate) enum Align {
 pub(crate) struct ItemNode<'a> {
     pub(crate) blocks: Option<u32>,
     pub(crate) next: Option<u32>,
+    /// kramdown's per-item "transparent" flag: the item's leading paragraph
+    /// renders inline (no `<p>` wrapper) even inside a LOOSE list, so a loose
+    /// list can mix tight and loose items. Set by the transparency fold in
+    /// [`parse_list_items`] (a block abuts the leading paragraph, or the
+    /// last-item special case, with the cross-item condition satisfied);
+    /// always `false` in a tight list, which renders every item inline anyway.
+    pub(crate) transparent: bool,
     /// Lifetime tie: an `ItemNode` with all-`None` index fields would
     /// otherwise be `'static`. Keeps `'a` bound to `src`.
     _marker: std::marker::PhantomData<&'a str>,
@@ -1772,11 +1779,13 @@ fn parse_list_items<'a>(
 ) -> Result<(Option<u32>, bool), Error> {
     let mut items = Chain::new();
     let mut item_idxs: Vec<u32> = Vec::new();
+    // Parallel to `item_idxs`: whether a blank line followed the item before the
+    // next sibling / list end. kramdown appends that blank to the item's value,
+    // so it is part of the `it_children` the transparency check sees — but we
+    // strip the trailing blank from the parsed chain, so track it separately to
+    // reconstruct the check's view.
+    let mut had_trailing_blank: Vec<bool> = Vec::new();
     let mut loose = false;
-    // `between_loose`: looseness came from a blank line BETWEEN two items (vs
-    // an internal blank inside one item). Only this kind, combined with a
-    // sub-list-ending item, triggers kramdown's per-item tight/loose mixing.
-    let mut between_loose = false;
     let mut tight_adjacent = false;
     let mut via_blank = false;
     // A line opens an item of THIS list when its marker sits at exactly the
@@ -1788,6 +1797,12 @@ fn parse_list_items<'a>(
     while *i < lines.len() {
         let l = lines[*i];
         if is_blank(l) {
+            // This blank follows the previous item's content (the item gather
+            // consumes a leading item's own internal blanks), so it is that
+            // item's trailing blank in kramdown's `it_children`.
+            if let Some(last) = had_trailing_blank.last_mut() {
+                *last = true;
+            }
             let mut j = *i;
             while j < lines.len() && is_blank(lines[j]) {
                 j += 1;
@@ -1802,7 +1817,6 @@ fn parse_list_items<'a>(
                     .is_some_and(|&p| item_ends_with_absorbing_block(ast, ast.items[p as usize].blocks));
                 if !prev_absorbs {
                     loose = true;
-                    between_loose = true;
                 }
                 via_blank = true;
                 *i = j;
@@ -1898,10 +1912,12 @@ fn parse_list_items<'a>(
             let idx = ast.push_item(ItemNode {
                 blocks,
                 next: None,
+                transparent: false,
                 _marker: std::marker::PhantomData,
             });
             items.link(idx, |p, n| ast.items[p as usize].next = Some(n));
             item_idxs.push(idx);
+            had_trailing_blank.push(false);
         } else if l.starts_with(' ') {
             // A marker/line indented off the list's base (e.g. a 1-space marker
             // at column 0, a same-level item kramdown keeps but we don't model).
@@ -1917,20 +1933,64 @@ fn parse_list_items<'a>(
     if loose && tight_adjacent {
         return Err(declined("mixed-loose-tight-list"));
     }
-    // When looseness comes from a blank BETWEEN items, kramdown renders the
-    // list UNIFORMLY (every item's leading paragraph wrapped in `<p>`) UNLESS
-    // some item makes its leading paragraph "transparent" — which happens when
-    // a block directly abuts it with NO blank line between (`- a:\n  - x`),
-    // turning that item tight while its siblings stay loose. That per-item
-    // mixing is what our single loose flag can't reproduce, so decline it; a
-    // list whose every item is blank-separated stays uniformly loose and is
-    // rendered natively.
-    if between_loose
-        && item_idxs
-            .iter()
-            .any(|&p| item_forces_loose_mixing(ast, ast.items[p as usize].blocks))
-    {
-        return Err(declined("list-loose-mixed"));
+    // Per-item tight/loose: in a LOOSE list kramdown makes an item's leading
+    // paragraph "transparent" (rendered inline, no `<p>`) under a precise
+    // condition, so a loose list can mix tight and loose items. We reproduce
+    // that fold (kramdown `list.rb`'s `it_children.first.options[:transparent]`
+    // logic) over the items in order; `emit_list` then renders each item per
+    // its flag. The reconstructed `it_children` adds back the trailing blank we
+    // strip from the parsed chain.
+    if loose {
+        let n = item_idxs.len();
+        // Whether some EARLIER item went transparent or did not lead with a
+        // paragraph (kramdown condition C's `list.children[0..-2].any?`).
+        let mut earlier_breaks_uniform = false;
+        for (k, &idx) in item_idxs.iter().enumerate() {
+            let blocks = ast.items[idx as usize].blocks;
+            let head_is_para =
+                blocks.is_some_and(|h| matches!(ast.blocks[h as usize].kind, BlockKind::Para(_)));
+            let second = blocks.and_then(|h| ast.blocks[h as usize].next);
+            let chain_len = block_chain_len(ast, blocks);
+            let eff_len = chain_len + usize::from(had_trailing_blank[k]);
+            // it_children[1] (when it exists) is a blank iff the parsed second
+            // block is a Blank, or it is the reconstructed trailing blank.
+            let child1_is_blank = match second {
+                Some(s) => matches!(ast.blocks[s as usize].kind, BlockKind::Blank),
+                None => had_trailing_blank[k] && chain_len == 1,
+            };
+            let is_last = k + 1 == n;
+            // B: leading paragraph not immediately followed by a blank, or the
+            // last-item special case (a lone `[p, blank]`, no EOB marker).
+            let cond_b = eff_len < 2 || !child1_is_blank || (is_last && eff_len == 2);
+            // C: not the last item, a single-item list, or some earlier item
+            // already broke uniformity.
+            let cond_c = !is_last || n == 1 || earlier_breaks_uniform;
+            let transparent = head_is_para && cond_b && cond_c;
+            ast.items[idx as usize].transparent = transparent;
+            if !head_is_para || transparent {
+                earlier_breaks_uniform = true;
+            }
+        }
+        // A transparent item renders its leading paragraph inline, then any
+        // remaining blocks below it (the inline shape tight lists already use).
+        // Verified for an abutting nested list or fenced code — the shapes
+        // kramdown's mixing produces in real content; decline a transparent
+        // item that abuts anything else, keeping output byte-identical.
+        for &idx in &item_idxs {
+            if !ast.items[idx as usize].transparent {
+                continue;
+            }
+            let blocks = ast.items[idx as usize].blocks;
+            if let Some(h) = blocks
+                && let Some(second) = ast.blocks[h as usize].next
+                && !matches!(
+                    ast.blocks[second as usize].kind,
+                    BlockKind::List { .. } | BlockKind::Code { .. } | BlockKind::Blank
+                )
+            {
+                return Err(declined("list-loose-mixed"));
+            }
+        }
     }
     // Tight items render inline (`<li>text</li>`) or as `<li>text\n<ul>…`. Only
     // a leading paragraph (+ trailing blocks) or a single non-paragraph block
@@ -1960,29 +2020,16 @@ fn item_ends_with_absorbing_block(ast: &Ast<'_>, blocks: Option<u32>) -> bool {
     absorbing
 }
 
-/// Whether this item would make kramdown switch a loose list into PER-ITEM
-/// tight/loose mixing — i.e. its leading paragraph goes "transparent" and is
-/// rendered inline (`<li>text…`) while loose siblings wrap in `<p>`.
-///
-/// kramdown makes the LEADING paragraph transparent when a block directly
-/// abuts it with no blank line between (its second child is not a `:blank`).
-/// Only the leading paragraph can go transparent — deeper blocks never do —
-/// so a `[Para, Blank, …]` item (the leading paragraph blank-separated from
-/// whatever follows, including a multi-paragraph item) stays uniformly loose.
-/// An item that LEADS with a non-paragraph block is outside the verified
-/// uniform-loose subset, so treat it as mixing too (conservative decline).
-fn item_forces_loose_mixing(ast: &Ast<'_>, blocks: Option<u32>) -> bool {
-    let Some(head) = blocks else {
-        return false; // empty item
-    };
-    let node = &ast.blocks[head as usize];
-    if !matches!(node.kind, BlockKind::Para(_)) {
-        return true; // leads with a non-paragraph block
+/// Number of blocks in an item's chain (each `Blank` run counts as one,
+/// matching kramdown's collapsed blank nodes).
+fn block_chain_len(ast: &Ast<'_>, blocks: Option<u32>) -> usize {
+    let mut cur = blocks;
+    let mut n = 0;
+    while let Some(b) = cur {
+        n += 1;
+        cur = ast.blocks[b as usize].next;
     }
-    match node.next {
-        None => false, // lone leading paragraph
-        Some(n) => !matches!(ast.blocks[n as usize].kind, BlockKind::Blank),
-    }
+    n
 }
 
 /// A tight list item renders inline only for these shapes: a leading
