@@ -1403,7 +1403,7 @@ where
     // The scratch parse uses its OWN bump (dropped when this returns): its
     // intermediate owned strings need not outlive the copy below, which
     // launders the kept ones into `ast.bump` (lifetime `'a`).
-    let scratch_bump = Bump::new();
+    let scratch_bump = Bump::with_capacity(joined.len());
     let mut scratch = Ast::with_capacity_for(joined.len(), &scratch_bump);
     // Give the scratch parse the document's link reference definitions so a
     // `[text][id]` on a de-prefixed line (a list/blockquote continuation that
@@ -1464,7 +1464,7 @@ fn parse_blocks_owned<'a>(ast: &mut Ast<'a>, lines: &[&str], opts: &Options) -> 
     // arithmetic holds. The result is deep-owned, so nothing borrows `joined`.
     let joined: String = lines.join("\n");
     let split: Vec<&str> = joined.split('\n').collect();
-    let scratch_bump = Bump::new();
+    let scratch_bump = Bump::with_capacity(joined.len());
     let mut scratch = Ast::with_capacity_for(joined.len(), &scratch_bump);
     scratch.link_defs = ast
         .link_defs

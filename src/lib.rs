@@ -121,7 +121,7 @@ pub fn to_html(
 ) -> Result<String, Error> {
     #[cfg(not(feature = "arena"))]
     {
-        let bump = bump::Bump::new();
+        let bump = bump::Bump::with_capacity(src.len());
         let (ast, root) = parse::parse(src, &bump, opts)?;
         Ok(html::convert(&ast, root, opts, highlighter, src.len()))
     }
@@ -135,7 +135,7 @@ pub fn to_html(
     {
         let guard = arena::Scope::enter();
         let built = (|| {
-            let bump = bump::Bump::new();
+            let bump = bump::Bump::with_capacity(src.len());
             let (ast, root) = parse::parse(src, &bump, opts)?;
             Ok(html::convert(&ast, root, opts, highlighter, src.len()))
         })();
@@ -173,19 +173,19 @@ pub fn profile_phases(src: &str, opts: &Options, iters: u32) -> (f64, f64) {
     // per-parse bump is built and dropped inside the loop so its cost is
     // part of the measured parse.
     for _ in 0..warm {
-        let bump = bump::Bump::new();
+        let bump = bump::Bump::with_capacity(src.len());
         std::hint::black_box(parse::parse(src, &bump, opts).ok());
     }
     let t = Instant::now();
     for _ in 0..iters {
-        let bump = bump::Bump::new();
+        let bump = bump::Bump::with_capacity(src.len());
         let parsed = parse::parse(src, &bump, opts).expect("profile corpus parses");
         std::hint::black_box(&parsed);
     }
     let parse_ns = t.elapsed().as_nanos() as f64 / iters as f64;
 
     // Convert phase: HTML emission over a fixed pre-parsed tree.
-    let bump = bump::Bump::new();
+    let bump = bump::Bump::with_capacity(src.len());
     let (ast, root) = parse::parse(src, &bump, opts).expect("profile corpus parses");
     let mut hl = NoHighlight;
     for _ in 0..warm {

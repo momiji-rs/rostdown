@@ -76,6 +76,19 @@ impl Bump {
         }
     }
 
+    /// An arena whose first chunk already holds ~`cap` bytes, so a render's
+    /// worth of owned strings (typography rewrites, de-prefixed bodies) lands
+    /// in one allocation instead of growing 4K→8K→16K→… through a chain of
+    /// `malloc`s. Sized from `src.len()`; over-sizing is lazy virtual pages,
+    /// so a generous estimate is free.
+    pub(crate) fn with_capacity(cap: usize) -> Bump {
+        let b = Bump::new();
+        if cap > 0 {
+            b.grow(cap);
+        }
+        b
+    }
+
     /// Copy `s` into the arena, returning a slice valid for `&self`.
     #[inline]
     pub(crate) fn alloc_str(&self, s: &str) -> &str {
@@ -186,6 +199,24 @@ mod tests {
         assert_eq!(got, big);
         // A small alloc after the oversized one still works.
         assert_eq!(b.alloc_str("tail"), "tail");
+    }
+
+    #[test]
+    fn with_capacity_holds_a_render_in_one_chunk() {
+        let b = Bump::with_capacity(4000);
+        // Many small allocs that together fit the pre-sized chunk should not
+        // grow it (one chunk), yet every handle stays valid.
+        let mut hs = Vec::new();
+        for i in 0..200 {
+            hs.push(b.alloc_str(&format!("s{i}")));
+        }
+        for (i, h) in hs.iter().enumerate() {
+            assert_eq!(*h, format!("s{i}"));
+        }
+        assert_eq!(b.chunks.borrow().len(), 1, "pre-sized chunk should suffice");
+        // A zero-capacity request is just an empty arena.
+        let z = Bump::with_capacity(0);
+        assert_eq!(z.alloc_str("x"), "x");
     }
 
     #[test]
