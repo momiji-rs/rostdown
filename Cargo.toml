@@ -11,18 +11,23 @@ authors = ["rubyrs contributors"]
 keywords = ["markdown", "kramdown", "html", "gfm"]
 categories = ["text-processing", "parser-implementations"]
 
+# The crate is dependency-free. Its `unsafe` is confined to two contained,
+# Miri-checked modules: the local bump arena (`src/bump.rs`, always on — it
+# backs the AST's owned strings) and, on aarch64, the baseline-NEON inline
+# scan (`next_trigger`, no feature gate — NEON is guaranteed present there,
+# so the `unsafe` is a formality). Both are byte-identical to the scalar
+# paths (pinned by tests). On non-aarch64 the inline scan is scalar.
 [features]
-# Opt-in scoped bump allocator (see src/arena.rs). Off by default keeps
-# the crate zero-dep, `unsafe`-free, and zero-overhead. An embedder that
-# enables it must also install `rostdown::ScopedAlloc` as its
-# `#[global_allocator]`; `to_html` then bump-allocates its AST and copies
-# the result out before resetting.
+# Opt-in scoped GLOBAL bump allocator (see src/arena.rs) — distinct from the
+# always-on local bump. An embedder that enables it must also install
+# `rostdown::ScopedAlloc` as its `#[global_allocator]`; `to_html` then
+# pointer-bumps everything (incl. the node Vecs) and resets wholesale.
 arena = []
 # Exposes `profile_phases` (parse-vs-convert split timing) for benchmarks.
 # Diagnostic only; not part of the public API.
 profiling = []
-# Opt-in SIMD byteset (NEON on aarch64) for the inline parser's trigger
-# scan. Adds `unsafe`; default stays unsafe-free with a scalar table.
+# Retained no-op: the NEON inline scan is now baseline-default on aarch64,
+# so this feature gates nothing. Kept so existing `rostdown/simd` deps build.
 simd = []
 
 [dependencies]

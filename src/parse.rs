@@ -3287,19 +3287,21 @@ fn is_trigger(c: u8) -> bool {
     TRIGGER[c as usize]
 }
 
-/// Index of the first trigger byte in `hay`, or `None`. Scalar (the
-/// `TRIGGER` table) by default; under `--features simd` on aarch64 a NEON
-/// byteset scans 16 bytes per iteration. The two paths MUST agree — the
-/// `next_trigger_matches_scalar` test pins it.
+/// Index of the first trigger byte in `hay`, or `None`. On aarch64 — where
+/// NEON is a *baseline* instruction set, always present — a NEON byteset
+/// scans 16 bytes per iteration; the lone `unsafe` is a formality (the
+/// intrinsics are guaranteed available), not a portability gate, so it runs
+/// in the default build. Elsewhere a scalar `TRIGGER`-table scan. The two
+/// paths MUST agree — the `next_trigger_matches_scalar` test pins it.
 #[inline]
 fn next_trigger(hay: &[u8]) -> Option<usize> {
-    #[cfg(all(target_arch = "aarch64", feature = "simd"))]
+    #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: bounded 16-byte loads (guarded by `+ 16 <= len`); NEON
         // is baseline on aarch64.
         unsafe { next_trigger_neon(hay) }
     }
-    #[cfg(not(all(target_arch = "aarch64", feature = "simd")))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
         hay.iter().position(|&b| TRIGGER[b as usize])
     }
@@ -3309,7 +3311,7 @@ fn next_trigger(hay: &[u8]) -> Option<usize> {
 // set iff bit `b>>4` is set in LO_NIB[b & 0xF]. HI_NIB[h] = 1<<h selects
 // that bit. High nibbles 8..15 (non-ASCII) map to 0 — never a trigger,
 // so multibyte UTF-8 is skipped as ordinary run text.
-#[cfg(all(target_arch = "aarch64", feature = "simd"))]
+#[cfg(target_arch = "aarch64")]
 const LO_NIB: [u8; 16] = {
     let mut t = [0u8; 16];
     let set = b"\\`*_[!<>&~{'\"-.";
@@ -3321,7 +3323,7 @@ const LO_NIB: [u8; 16] = {
     }
     t
 };
-#[cfg(all(target_arch = "aarch64", feature = "simd"))]
+#[cfg(target_arch = "aarch64")]
 const HI_NIB: [u8; 16] = {
     let mut t = [0u8; 16];
     let mut h = 0;
@@ -3332,7 +3334,7 @@ const HI_NIB: [u8; 16] = {
     t
 };
 
-#[cfg(all(target_arch = "aarch64", feature = "simd"))]
+#[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn next_trigger_neon(hay: &[u8]) -> Option<usize> {
     use core::arch::aarch64::*;
@@ -4058,8 +4060,8 @@ mod byte_opt_tests {
     #[test]
     fn next_trigger_matches_scalar() {
         // Every value 0..=255 (incl. non-ASCII, which must NOT match) at
-        // every length — exercises the NEON path under `--features simd`
-        // against the scalar `is_trigger` oracle.
+        // every length — exercises the aarch64 NEON path (the default build
+        // there) against the scalar `is_trigger` oracle.
         let bytes: Vec<u8> = (0u8..=255).cycle().take(400).collect();
         for len in 0..bytes.len() {
             let hay = &bytes[..len];
