@@ -269,6 +269,11 @@ fn emit_table(
 /// side table — used inside the open tag, after the element's own attrs.
 #[inline]
 fn emit_span_ial(out: &mut String, ast: &Ast<'_>, idx: u32) {
+    // Most documents carry no span IALs at all; skip the per-span hash
+    // lookup (called for every em/strong/link) when the side table is empty.
+    if ast.span_ials.is_empty() {
+        return;
+    }
     if let Some(attrs) = ast.span_ials.get(&idx) {
         emit_attrs(out, attrs);
     }
@@ -728,11 +733,32 @@ fn slug_char(ch: char) -> SlugChar {
 
 pub(crate) fn gfm_slug(span_text: &str) -> Option<String> {
     let mut id = String::with_capacity(span_text.len());
-    for ch in span_text.chars() {
-        match slug_char(ch) {
-            SlugChar::Keep(c) => id.push(c),
-            SlugChar::Drop => {}
-            SlugChar::Unsupported => return None,
+    let bytes = span_text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 0x80 {
+            // ASCII fast path — heading text is overwhelmingly ASCII, so
+            // skip the UTF-8 decode. Mirrors `slug_char`'s ASCII arms
+            // exactly: word chars kept (upper → lower), space/tab → `-`,
+            // every other ASCII byte (punctuation) dropped.
+            match b {
+                b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' => id.push(b as char),
+                b'A'..=b'Z' => id.push((b + 32) as char),
+                b' ' | b'\t' => id.push('-'),
+                _ => {}
+            }
+            i += 1;
+        } else {
+            // SAFETY-free: index is a char boundary (we only advance past
+            // whole chars), so `chars().next()` yields the char at `i`.
+            let ch = span_text[i..].chars().next().unwrap();
+            match slug_char(ch) {
+                SlugChar::Keep(c) => id.push(c),
+                SlugChar::Drop => {}
+                SlugChar::Unsupported => return None,
+            }
+            i += ch.len_utf8();
         }
     }
     if id.is_empty() { None } else { Some(id) }
