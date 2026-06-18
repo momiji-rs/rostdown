@@ -805,11 +805,16 @@ fn parse_blocks<'a>(
 
         // A top-level pipe table. Heading/list/quote/fence take precedence
         // (handled inside); a pipe-shaped run that isn't a clean table
-        // returns None and falls through to the pipe-decline below.
-        if let Some((kind, consumed)) = try_parse_table(ast, lines, i, opts)? {
-            emit_block!(kind);
-            i += consumed;
-            continue;
+        // returns None and falls through to the pipe-decline below. A line
+        // with NO pipe can be neither a table row nor a pipe-decline, so one
+        // memchr here skips both the table parse and the decline scan below.
+        let line_has_pipe = line.as_bytes().contains(&b'|');
+        if line_has_pipe {
+            if let Some((kind, consumed)) = try_parse_table(ast, lines, i, opts)? {
+                emit_block!(kind);
+                i += consumed;
+                continue;
+            }
         }
 
         // A raw HTML block opening (column 0) with a block-level element. We
@@ -848,7 +853,8 @@ fn parse_blocks<'a>(
         // path (NOT a decline), matching kramdown. A list-marker line is
         // exempt: kramdown keeps it a list and builds a `<table>` per item, so
         // it is the list handler's job (below), not a block-level decline.
-        if list_marker(line).is_none()
+        if line_has_pipe
+            && list_marker(line).is_none()
             && has_table_pipe(trim_start_ws(line))
             && block_all_pipe(lines, i, opts)
         {
