@@ -456,6 +456,19 @@ fn trim_start_ws(s: &str) -> &str {
     &s[i..]
 }
 
+/// Count of leading ASCII spaces — a tight byte loop, faster on the hot
+/// per-line indent checks than the generic `str::trim_start_matches(' ')`
+/// (which iterates `char`s through the `Pattern` machinery).
+#[inline]
+fn leading_spaces(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i] == b' ' {
+        i += 1;
+    }
+    i
+}
+
 /// `str::trim_end` with an ASCII fast path (non-ASCII boundary ⇒ defer to
 /// the Unicode-aware trim, which may strip more).
 #[inline]
@@ -746,7 +759,7 @@ fn parse_blocks<'a>(
         // decline.
         if line.trim_start_matches([' ', '\t']).starts_with("{:")
             && !line.trim_start_matches([' ', '\t']).starts_with("{::")
-            && line.len() - line.trim_start_matches(' ').len() <= 3
+            && leading_spaces(line) <= 3
         {
             let t = line.trim_matches([' ', '\t']);
             let inner_opt = t.strip_prefix("{:").and_then(|s| s.strip_suffix('}'));
@@ -996,7 +1009,7 @@ fn parse_blocks<'a>(
         // kramdown ignores 1–3 leading spaces (OPT_SPACE) before the opening
         // fence (GFM); the body is kept VERBATIM (not de-indented). Under
         // core, only a column-0 fence is in subset.
-        let fence_indent = line.len() - line.trim_start_matches(' ').len();
+        let fence_indent = leading_spaces(line);
         let fline = if (fence_indent == 0 || opts.gfm) && fence_indent <= 3 {
             &line[fence_indent..]
         } else {
@@ -1051,7 +1064,7 @@ fn parse_blocks<'a>(
                 // allowed on a closing fence). Under GFM the close may carry
                 // 1–3 leading spaces (OPT_SPACE), mirroring the opener.
                 let cl = if opts.gfm {
-                    let b = l.trim_start_matches(' ');
+                    let b = &l[leading_spaces(l)..];
                     if l.len() - b.len() <= 3 { b } else { l }
                 } else {
                     l
@@ -1131,7 +1144,7 @@ fn parse_blocks<'a>(
                     // Break so the top-level scan attaches it to the emitted
                     // Quote block — NOT absorb it into the quote body, where
                     // it would mis-attach to the inner paragraph.
-                    let t = l.trim_start_matches(' ');
+                    let t = &l[leading_spaces(l)..];
                     if t.starts_with("{:") && !t.starts_with("{::") {
                         break;
                     }
@@ -1197,7 +1210,7 @@ fn parse_blocks<'a>(
         // and content at `base`+, lazy lines keeping their full indent — so a
         // lazy continuation's residual leading space is preserved verbatim
         // (the flat-de-indent approach used to drop it).
-        let base = line.len() - line.trim_start_matches(' ').len();
+        let base = leading_spaces(line);
         if (1..=3).contains(&base)
             && let Some(ordered) = list_marker(&line[base..])
         {
@@ -1270,7 +1283,7 @@ fn parse_blocks<'a>(
                 let lt = l.trim_start_matches([' ', '\t']);
                 if lt.starts_with("{:")
                     && !lt.starts_with("{::")
-                    && l.len() - l.trim_start_matches(' ').len() <= 3
+                    && leading_spaces(l) <= 3
                 {
                     break;
                 }
@@ -1292,7 +1305,7 @@ fn parse_blocks<'a>(
                 // fence opener interrupts only when the fence actually CLOSES;
                 // an unclosed run stays paragraph text (kramdown), where its
                 // tildes may parse as `~~`-strikethrough.
-                let st = l.trim_start_matches(' ');
+                let st = &l[leading_spaces(l)..];
                 let nonclosing_fence = (st.starts_with("```") || st.starts_with("~~~"))
                     && fence_close_index(lines, i, opts).is_none();
                 if !nonclosing_fence {
@@ -1318,7 +1331,7 @@ fn parse_blocks<'a>(
             decline_block_scan(l, !first)?;
             if first {
                 // First line: drop OPT_SPACE indent (a sub-slice move).
-                first_line = Some(l.trim_start_matches(' '));
+                first_line = Some(&l[leading_spaces(l)..]);
             } else {
                 // Interior line endings carry hard-break semantics; the
                 // just-completed line (`prev_line`) is now interior.
@@ -1903,7 +1916,7 @@ fn decline_block_scan(line: &str, allow_indented: bool) -> Result<(), Error> {
 /// this predicate governs the remaining mid-paragraph / list-continuation
 /// contexts, where the indented opener still declines (conservative-safe).
 fn opt_space_opener(line: &str, opts: &Options) -> bool {
-    let n = line.len() - line.trim_start_matches(' ').len();
+    let n = leading_spaces(line);
     if !(1..=3).contains(&n) {
         return false;
     }
@@ -1958,7 +1971,7 @@ fn expand_leading_tabs(line: &str) -> String {
 /// real, closed fence) or stays paragraph text (an unclosed run).
 fn fence_close_index(lines: &[&str], start: usize, opts: &Options) -> Option<usize> {
     let line = lines[start];
-    let indent = line.len() - line.trim_start_matches(' ').len();
+    let indent = leading_spaces(line);
     let fline = if (indent == 0 || opts.gfm) && indent <= 3 {
         &line[indent..]
     } else {
@@ -1982,7 +1995,7 @@ fn fence_close_index(lines: &[&str], start: usize, opts: &Options) -> Option<usi
     }
     for (off, &l) in lines[start + 1..].iter().enumerate() {
         let cl = if opts.gfm {
-            let b = l.trim_start_matches(' ');
+            let b = &l[leading_spaces(l)..];
             if l.len() - b.len() <= 3 { b } else { l }
         } else {
             l
@@ -2051,7 +2064,7 @@ fn parse_list_items<'a>(
     // A line opens an item of THIS list when its marker sits at exactly the
     // list's own indent `base` (0 for a column-0 list, 1–3 under OPT_SPACE).
     let is_item_start = |l: &str| {
-        let ind = l.len() - l.trim_start_matches(' ').len();
+        let ind = leading_spaces(l);
         ind == base && list_marker(&l[base..]) == Some(ordered)
     };
     while *i < lines.len() {
@@ -2118,7 +2131,7 @@ fn parse_list_items<'a>(
                     }
                     let nxt_indented = j < lines.len()
                         && lines[j].as_bytes().first() != Some(&b'\t')
-                        && (lines[j].len() - lines[j].trim_start_matches(' ').len()) >= content_col;
+                        && (leading_spaces(lines[j])) >= content_col;
                     if nxt_indented {
                         // Internal blank(s): the item continues with another
                         // block at the content column — a multi-block item.
@@ -2139,7 +2152,7 @@ fn parse_list_items<'a>(
                     raw
                 };
                 let cls: &str = cl;
-                let lead = cls.len() - cls.trim_start_matches(' ').len();
+                let lead = leading_spaces(cls);
                 let trimmed = &cls[lead..];
                 if lead >= content_col {
                     // Content line: strip the content column (a deeper indent
@@ -3337,7 +3350,7 @@ fn parse_def_title(s: &str) -> Option<&str> {
 /// such a line, so we do too. `None` unless the whole line is a clean
 /// single-line definition.
 fn parse_link_def(line: &str) -> Option<(String, &str, Option<&str>)> {
-    let lead = line.len() - line.trim_start_matches(' ').len();
+    let lead = leading_spaces(line);
     if lead > 3 {
         return None; // ≥4 spaces is indented code, not a definition
     }
@@ -3399,7 +3412,7 @@ fn parse_link_def(line: &str) -> Option<(String, &str, Option<&str>)> {
 /// would accept but [`parse_link_def`] can't reproduce (e.g. a destination
 /// with embedded spaces from an unexpanded Liquid `{{ … }}`).
 fn looks_like_link_def(line: &str) -> bool {
-    let lead = line.len() - line.trim_start_matches(' ').len();
+    let lead = leading_spaces(line);
     if lead > 3 {
         return false;
     }
