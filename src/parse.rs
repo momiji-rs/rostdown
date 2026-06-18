@@ -332,6 +332,29 @@ fn offset_in(src: &str, s: &str) -> usize {
     s.as_ptr() as usize - src.as_ptr() as usize
 }
 
+/// `offset_in` that yields `None` when `s` is not a sub-slice of `src` (its
+/// pointer falls outside `src`'s byte range) instead of underflowing. The
+/// contiguity checks feed this lines that may be a `""` literal standing in
+/// for a list item's internal blank line — not a sub-slice of `src`, so by
+/// definition not contiguous.
+#[inline]
+fn offset_in_checked(src: &str, s: &str) -> Option<usize> {
+    let off = (s.as_ptr() as usize).checked_sub(src.as_ptr() as usize)?;
+    (off <= src.len()).then_some(off)
+}
+
+/// Does line `cur` sit immediately after `prev` in `src` (exactly one `\n`
+/// between)? False when either slice is not a sub-slice of `src` — e.g. the
+/// `""` literal a list item carries for an internal blank line — so such a
+/// body is joined into an owned `String` rather than borrowed from `src`.
+#[inline]
+fn abuts_in(src: &str, prev: &str, cur: &str) -> bool {
+    match (offset_in_checked(src, prev), offset_in_checked(src, cur)) {
+        (Some(p), Some(c)) => c == p + prev.len() + 1,
+        _ => false,
+    }
+}
+
 /// ASCII whitespace per `char::is_whitespace` (note: includes VT `0x0B`,
 /// which `u8::is_ascii_whitespace` omits).
 #[inline]
@@ -822,10 +845,11 @@ fn parse_blocks<'a>(
                     break;
                 }
                 if let Some(prev) = prev_body
-                    && offset_in(src, l) != offset_in(src, prev) + prev.len() + 1
+                    && !abuts_in(src, prev, l)
                 {
-                    // De-prefixed lines (fence inside a blockquote / list):
-                    // not contiguous in `src`, so we must join an owned body.
+                    // De-prefixed lines (fence inside a blockquote / list), or a
+                    // `""` line standing in for an item's internal blank: not
+                    // contiguous in `src`, so we must join an owned body.
                     contiguous = false;
                 }
                 if first_body.is_none() {
@@ -1065,7 +1089,7 @@ fn parse_blocks<'a>(
                 // Contiguity: this line must abut the previous one in
                 // `src` with exactly one `\n` between (true at top level;
                 // false once `>`/indent prefixes were stripped).
-                if offset_in(src, l) != offset_in(src, prev_line) + prev_line.len() + 1 {
+                if !abuts_in(src, prev_line, l) {
                     contiguous = false;
                 }
             }

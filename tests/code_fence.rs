@@ -104,6 +104,20 @@ fn info_string_is_a_single_token() {
 }
 
 #[test]
+fn fence_with_internal_blank_inside_a_list_item() {
+    // A fenced code block carried as a trailing block of a list item, whose
+    // BODY contains a blank line. The recursive item parse records that blank
+    // as a `""` placeholder (not a sub-slice of `src`); the fence body must
+    // still reconstruct verbatim — the contiguity check treats the `""` as
+    // non-abutting and joins an owned body rather than underflowing the
+    // pointer arithmetic. Byte-identical to kramdown (GFM profile).
+    ok(
+        "1. text\n\n   ```sh\n   a\n\n   b\n   ```\n",
+        "<ol>\n  <li>\n    <p>text</p>\n\n    <pre><code class=\"language-sh\">a\n\nb\n</code></pre>\n  </li>\n</ol>\n",
+    );
+}
+
+#[test]
 fn opt_space_open_and_close_indents_may_differ() {
     // The opener's and closer's 0–3 indents are independent.
     ok(
