@@ -475,6 +475,23 @@ fn set_attr<'a>(attrs: &mut Vec<(Cow<'a, str>, String)>, key: Cow<'a, str>, val:
     }
 }
 
+/// Merge a second IAL's attributes into an element's existing ones with
+/// kramdown's chained-IAL semantics (`…{:.a}{:rel=b}`): a `class` accumulates
+/// (space-joined), every other key overrides (last wins); insertion order is
+/// preserved so the serialized attribute order matches kramdown's.
+fn merge_ial<'a>(existing: &mut Vec<(Cow<'a, str>, String)>, new: Vec<(Cow<'a, str>, String)>) {
+    for (k, v) in new {
+        if k.as_ref() == "class"
+            && let Some(e) = existing.iter_mut().find(|(ek, _)| ek.as_ref() == "class")
+        {
+            e.1.push(' ');
+            e.1.push_str(&v);
+        } else {
+            set_attr(existing, k, v);
+        }
+    }
+}
+
 /// Parse a block IAL's inner content (between `{:` and `}`) into kramdown's
 /// insertion-ordered attribute list: `.class` (dot- or space-separated)
 /// accumulates under `class`, `#id` sets `id`, and `key="v"` / `key='v'` /
@@ -2819,14 +2836,15 @@ fn parse_spans_until<'a>(
                     && let Some(close_rel) = text[i + 2..].find('}')
                     && let Some(attrs) = parse_ial(&text[i + 2..i + 2 + close_rel])
                 {
-                    // A second IAL abutting the same span (`…{:.a}{:.b}`)
-                    // would need kramdown's cross-IAL attribute merge (class
-                    // accumulation, id override) we don't model — declining
-                    // beats dropping the first or emitting a duplicate attr.
-                    if ast.span_ials.contains_key(&last) {
-                        return Err(declined("chained-span-ial"));
+                    // A second IAL abutting the same span (`…{:.a}{:rel=b}`)
+                    // merges with kramdown's chained-IAL semantics (class
+                    // accumulates, every other key overrides, order preserved).
+                    match ast.span_ials.get_mut(&last) {
+                        Some(existing) => merge_ial(existing, attrs),
+                        None => {
+                            ast.span_ials.insert(last, attrs);
+                        }
                     }
-                    ast.span_ials.insert(last, attrs);
                     i += 2 + close_rel + 1;
                     continue;
                 }
