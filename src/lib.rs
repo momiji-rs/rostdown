@@ -15,6 +15,7 @@
 mod html;
 #[cfg(feature = "arena")]
 mod arena;
+mod bump;
 mod entities;
 mod html_block;
 mod parse;
@@ -120,7 +121,8 @@ pub fn to_html(
 ) -> Result<String, Error> {
     #[cfg(not(feature = "arena"))]
     {
-        let (ast, root) = parse::parse(src, opts)?;
+        let bump = bump::Bump::new();
+        let (ast, root) = parse::parse(src, &bump, opts)?;
         Ok(html::convert(&ast, root, opts, highlighter, src.len()))
     }
     // With the `arena` feature, run the parse+convert inside a bump
@@ -133,7 +135,8 @@ pub fn to_html(
     {
         let guard = arena::Scope::enter();
         let built = (|| {
-            let (ast, root) = parse::parse(src, opts)?;
+            let bump = bump::Bump::new();
+            let (ast, root) = parse::parse(src, &bump, opts)?;
             Ok(html::convert(&ast, root, opts, highlighter, src.len()))
         })();
         match built {
@@ -166,19 +169,24 @@ pub fn profile_phases(src: &str, opts: &Options, iters: u32) -> (f64, f64) {
     use std::time::Instant;
     let warm = (iters / 5).max(3);
 
-    // Parse phase: full parse (builds + drops the arena each iter).
+    // Parse phase: full parse (builds + drops the arena each iter). The
+    // per-parse bump is built and dropped inside the loop so its cost is
+    // part of the measured parse.
     for _ in 0..warm {
-        std::hint::black_box(parse::parse(src, opts).ok());
+        let bump = bump::Bump::new();
+        std::hint::black_box(parse::parse(src, &bump, opts).ok());
     }
     let t = Instant::now();
     for _ in 0..iters {
-        let parsed = parse::parse(src, opts).expect("profile corpus parses");
+        let bump = bump::Bump::new();
+        let parsed = parse::parse(src, &bump, opts).expect("profile corpus parses");
         std::hint::black_box(&parsed);
     }
     let parse_ns = t.elapsed().as_nanos() as f64 / iters as f64;
 
     // Convert phase: HTML emission over a fixed pre-parsed tree.
-    let (ast, root) = parse::parse(src, opts).expect("profile corpus parses");
+    let bump = bump::Bump::new();
+    let (ast, root) = parse::parse(src, &bump, opts).expect("profile corpus parses");
     let mut hl = NoHighlight;
     for _ in 0..warm {
         std::hint::black_box(html::convert(&ast, root, opts, &mut hl, src.len()));

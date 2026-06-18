@@ -6,6 +6,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use crate::bump::Bump;
 use crate::{Error, Options, typography};
 
 /// The element tree is a *borrowed, flat-arena* AST.
@@ -41,8 +42,15 @@ type LinkDefs<'a> = HashMap<String, (&'a str, Option<&'a str>)>;
 /// so the hot per-span `SpanNode` stays small. Empty for most docs.
 type SpanIals<'a> = HashMap<u32, Vec<(Cow<'a, str>, String)>>;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Ast<'a> {
+    /// Bump arena backing every owned string in this AST: typography
+    /// rewrites, de-prefixed blockquote/list bodies, code text. Owned
+    /// values are copied in once via [`Bump::alloc_str`] and stored as
+    /// `Cow::Borrowed`, so a node owns no heap and its `Drop` does no
+    /// `free`. Borrows `src`'s lifetime (the arena outlives the AST inside
+    /// `to_html`).
+    pub(crate) bump: &'a Bump,
     pub(crate) blocks: Vec<BlockNode<'a>>,
     pub(crate) spans: Vec<SpanNode<'a>>,
     pub(crate) items: Vec<ItemNode<'a>>,
@@ -68,10 +76,6 @@ pub(crate) struct TocEntry {
 }
 
 impl<'a> Ast<'a> {
-    fn new() -> Self {
-        Ast::default()
-    }
-
     /// Pre-size the arenas from the source length so the hot top-level
     /// parse rarely re-grows (each regrow is a realloc + memcpy of the
     /// whole arena — the dominant cost once per-node `Vec`s are gone).
@@ -79,8 +83,9 @@ impl<'a> Ast<'a> {
     /// of source — prose plus markup splits), blocks ~1 / 40 B, items
     /// far rarer. Generous but bounded; a tiny doc still costs three
     /// small `Vec`s, an over-estimate just over-reserves once.
-    fn with_capacity_for(src_len: usize) -> Self {
+    fn with_capacity_for(src_len: usize, bump: &'a Bump) -> Self {
         Ast {
+            bump,
             blocks: Vec::with_capacity(src_len / 40 + 8),
             spans: Vec::with_capacity(src_len / 12 + 16),
             items: Vec::with_capacity(src_len / 256 + 4),
@@ -326,7 +331,11 @@ fn split_lines(src: &str) -> Vec<&str> {
 /// Parse `src` into a flat-arena [`Ast`]. The returned `root` is the
 /// index of the first top-level block (`None` for an empty document);
 /// the converter walks the arenas from there.
-pub(crate) fn parse<'a>(src: &'a str, opts: &Options) -> Result<(Ast<'a>, Option<u32>), Error> {
+pub(crate) fn parse<'a>(
+    src: &'a str,
+    bump: &'a Bump,
+    opts: &Options,
+) -> Result<(Ast<'a>, Option<u32>), Error> {
     let lines: Vec<&'a str> = split_lines(src);
     // A trailing "\n" yields one empty last element — drop it so it
     // doesn't read as a blank line.
@@ -334,7 +343,7 @@ pub(crate) fn parse<'a>(src: &'a str, opts: &Options) -> Result<(Ast<'a>, Option
         Some(&"") => &lines[..lines.len() - 1],
         _ => &lines[..],
     };
-    let mut ast = Ast::with_capacity_for(src.len());
+    let mut ast = Ast::with_capacity_for(src.len(), bump);
     // Pre-pass: lift block-level link reference definitions out of the
     // stream so the surrounding blank lines collapse the way kramdown's
     // do, and so `[text][id]` / `[text]` resolve during span parsing.
@@ -1391,7 +1400,11 @@ fn parse_spans_owned<'a, 'j>(
 where
     'a: 'j,
 {
-    let mut scratch: Ast<'j> = Ast::new();
+    // The scratch parse uses its OWN bump (dropped when this returns): its
+    // intermediate owned strings need not outlive the copy below, which
+    // launders the kept ones into `ast.bump` (lifetime `'a`).
+    let scratch_bump = Bump::new();
+    let mut scratch = Ast::with_capacity_for(joined.len(), &scratch_bump);
     // Give the scratch parse the document's link reference definitions so a
     // `[text][id]` on a de-prefixed line (a list/blockquote continuation that
     // had to be joined into an owned buffer) still resolves. The def urls
@@ -1406,33 +1419,31 @@ where
 }
 
 /// Copy the span chain starting at `head` from `scratch` into `dst`,
-/// making every text `Cow` owned (`'static`) so it no longer borrows
-/// `scratch`'s backing text. Returns the head index in `dst`.
+/// re-homing every text `Cow` into `dst`'s bump arena (a `Cow::Borrowed`
+/// with `dst`'s lifetime) so it no longer borrows `scratch`'s backing text.
+/// Returns the head index in `dst`.
 fn copy_spans_owned<'a>(dst: &mut Ast<'a>, scratch: &Ast<'_>, head: Option<u32>) -> Option<u32> {
+    let bump = dst.bump;
     let mut chain = Chain::new();
     let mut cur = head;
     while let Some(idx) = cur {
         let node = &scratch.spans[idx as usize];
         let kind = match &node.kind {
-            SpanKind::Text(t) => SpanKind::Text(Cow::Owned(t.clone().into_owned())),
-            SpanKind::Raw(t) => SpanKind::Raw(Cow::Owned(t.clone().into_owned())),
-            SpanKind::Code(t) => SpanKind::Code(Cow::Owned(t.clone().into_owned())),
+            SpanKind::Text(t) => SpanKind::Text(Cow::Borrowed(bump.alloc_str(t))),
+            SpanKind::Raw(t) => SpanKind::Raw(Cow::Borrowed(bump.alloc_str(t))),
+            SpanKind::Code(t) => SpanKind::Code(Cow::Borrowed(bump.alloc_str(t))),
             SpanKind::Em(inner) => SpanKind::Em(copy_spans_owned(dst, scratch, *inner)),
             SpanKind::Strong(inner) => SpanKind::Strong(copy_spans_owned(dst, scratch, *inner)),
             SpanKind::Del(inner) => SpanKind::Del(copy_spans_owned(dst, scratch, *inner)),
             SpanKind::Link { spans, href, title } => SpanKind::Link {
                 spans: copy_spans_owned(dst, scratch, *spans),
-                href: Cow::Owned(href.clone().into_owned()),
-                title: title
-                    .as_ref()
-                    .map(|t| Cow::Owned(t.clone().into_owned())),
+                href: Cow::Borrowed(bump.alloc_str(href)),
+                title: title.as_ref().map(|t| Cow::Borrowed(bump.alloc_str(t))),
             },
             SpanKind::Image { src, alt, title } => SpanKind::Image {
-                src: Cow::Owned(src.clone().into_owned()),
-                alt: Cow::Owned(alt.clone().into_owned()),
-                title: title
-                    .as_ref()
-                    .map(|t| Cow::Owned(t.clone().into_owned())),
+                src: Cow::Borrowed(bump.alloc_str(src)),
+                alt: Cow::Borrowed(bump.alloc_str(alt)),
+                title: title.as_ref().map(|t| Cow::Borrowed(bump.alloc_str(t))),
             },
         };
         let new_idx = dst.push_span(kind);
@@ -1453,7 +1464,8 @@ fn parse_blocks_owned<'a>(ast: &mut Ast<'a>, lines: &[&str], opts: &Options) -> 
     // arithmetic holds. The result is deep-owned, so nothing borrows `joined`.
     let joined: String = lines.join("\n");
     let split: Vec<&str> = joined.split('\n').collect();
-    let mut scratch: Ast<'_> = Ast::new();
+    let scratch_bump = Bump::new();
+    let mut scratch = Ast::with_capacity_for(joined.len(), &scratch_bump);
     scratch.link_defs = ast
         .link_defs
         .iter()
@@ -1463,10 +1475,12 @@ fn parse_blocks_owned<'a>(ast: &mut Ast<'a>, lines: &[&str], opts: &Options) -> 
     Ok(copy_blocks_owned(ast, &scratch, head))
 }
 
-/// Deep-own an IAL list (used by [`copy_blocks_owned`]).
-fn own_ial<'a>(ial: &[(Cow<'_, str>, String)]) -> Vec<(Cow<'a, str>, String)> {
+/// Re-home an IAL list's keys into `bump` (used by [`copy_blocks_owned`]).
+/// Values stay owned `String`s — IALs are rare, so they keep the simple
+/// representation rather than threading the bump through their producers.
+fn own_ial<'a>(bump: &'a Bump, ial: &[(Cow<'_, str>, String)]) -> Vec<(Cow<'a, str>, String)> {
     ial.iter()
-        .map(|(k, v)| (Cow::Owned(k.clone().into_owned()), v.clone()))
+        .map(|(k, v)| (Cow::Borrowed(bump.alloc_str(k)), v.clone()))
         .collect()
 }
 
@@ -1474,6 +1488,7 @@ fn own_ial<'a>(ial: &[(Cow<'_, str>, String)]) -> Vec<(Cow<'a, str>, String)> {
 /// `Cow` (text, ial, span/item children) so nothing borrows `scratch`. Returns
 /// the head index in `dst`.
 fn copy_blocks_owned<'a>(dst: &mut Ast<'a>, scratch: &Ast<'_>, head: Option<u32>) -> Option<u32> {
+    let bump = dst.bump;
     let mut chain = Chain::new();
     let mut cur = head;
     while let Some(idx) = cur {
@@ -1489,14 +1504,14 @@ fn copy_blocks_owned<'a>(dst: &mut Ast<'a>, scratch: &Ast<'_>, head: Option<u32>
                 spans,
             } => BlockKind::Heading {
                 level: *level,
-                raw: Cow::Owned(raw.clone().into_owned()),
-                span_text: Cow::Owned(span_text.clone().into_owned()),
+                raw: Cow::Borrowed(bump.alloc_str(raw)),
+                span_text: Cow::Borrowed(bump.alloc_str(span_text)),
                 spans: copy_spans_owned(dst, scratch, *spans),
             },
             BlockKind::Quote(inner) => BlockKind::Quote(copy_blocks_owned(dst, scratch, *inner)),
             BlockKind::Code { lang, text } => BlockKind::Code {
-                lang: lang.as_ref().map(|l| Cow::Owned(l.clone().into_owned())),
-                text: Cow::Owned(text.clone().into_owned()),
+                lang: lang.as_ref().map(|l| Cow::Borrowed(bump.alloc_str(l))),
+                text: Cow::Borrowed(bump.alloc_str(text)),
             },
             BlockKind::RawHtml { html, md_spans } => BlockKind::RawHtml {
                 html: html.clone(),
@@ -1532,7 +1547,7 @@ fn copy_blocks_owned<'a>(dst: &mut Ast<'a>, scratch: &Ast<'_>, head: Option<u32>
             },
         };
         let new_idx = dst.push_block(kind);
-        dst.blocks[new_idx as usize].ial = own_ial(&node.ial);
+        dst.blocks[new_idx as usize].ial = own_ial(bump, &node.ial);
         chain.link(new_idx, |p, n| dst.blocks[p as usize].next = Some(n));
         cur = node.next;
     }
@@ -2586,20 +2601,29 @@ struct TextRun<'a> {
     text: &'a str,
     seg_start: usize,
     seg_end: usize,
-    owned: Option<String>,
+    /// Scratch for a rewritten (typography / escape) run, reused across the
+    /// runs of one inline context: cleared — not freed — between flushes, so
+    /// a prose paragraph with many smart-quote / dash rewrites pays one
+    /// buffer allocation, not one per run. The finished text is copied into
+    /// the AST bump on flush (a `Cow::Borrowed`, so the span node owns no
+    /// heap). `materialized` is true once the current run has diverged from
+    /// a borrowable source slice into `owned`.
+    owned: String,
+    materialized: bool,
 }
 
 impl<'a> TextRun<'a> {
     #[inline]
     fn new(text: &'a str) -> Self {
-        TextRun { text, seg_start: 0, seg_end: 0, owned: None }
+        TextRun { text, seg_start: 0, seg_end: 0, owned: String::new(), materialized: false }
     }
 
     #[inline]
     fn is_empty(&self) -> bool {
-        match &self.owned {
-            Some(s) => s.is_empty(),
-            None => self.seg_start == self.seg_end,
+        if self.materialized {
+            self.owned.is_empty()
+        } else {
+            self.seg_start == self.seg_end
         }
     }
 
@@ -2608,7 +2632,7 @@ impl<'a> TextRun<'a> {
     /// segment has been recorded). A no-op once a segment is in progress.
     #[inline]
     fn restart_if_empty(&mut self, pos: usize) {
-        if self.owned.is_none() && self.seg_start == self.seg_end {
+        if !self.materialized && self.seg_start == self.seg_end {
             self.seg_start = pos;
             self.seg_end = pos;
         }
@@ -2621,8 +2645,8 @@ impl<'a> TextRun<'a> {
     fn push_verbatim(&mut self, a: usize, b: usize) {
         self.restart_if_empty(a);
         debug_assert_eq!(a, self.seg_end, "non-contiguous verbatim run");
-        if let Some(owned) = &mut self.owned {
-            owned.push_str(&self.text[a..b]);
+        if self.materialized {
+            self.owned.push_str(&self.text[a..b]);
         }
         self.seg_end = b;
     }
@@ -2637,38 +2661,46 @@ impl<'a> TextRun<'a> {
 
     /// Record a rewritten char `ch` that replaces source `text[a..b]`
     /// (typography / escape). This breaks the borrow: materialize the
-    /// pristine prefix once, then push `ch`. `a` must abut the segment.
+    /// pristine prefix into the reused buffer once, then push `ch`. `a`
+    /// must abut the segment.
     #[inline]
     fn push_char(&mut self, ch: char, a: usize, b: usize) {
         self.restart_if_empty(a);
         debug_assert_eq!(a, self.seg_end, "non-contiguous rewrite");
-        let owned = self.owned.get_or_insert_with(|| {
-            // Copy the verbatim prefix collected so far, then diverge.
-            self.text[self.seg_start..self.seg_end].to_owned()
-        });
-        owned.push(ch);
+        if !self.materialized {
+            // Diverge: seed the (cleared) buffer with the borrowable prefix.
+            // Reserve the whole context up front: once a run materializes,
+            // every later verbatim byte of it is copied in too, so `owned`
+            // grows toward `text.len()` — one reservation beats a chain of
+            // doubling reallocs. The buffer is reused across the context's
+            // runs (clear keeps capacity), so this is paid once.
+            self.owned.clear();
+            self.owned.reserve(self.text.len());
+            self.owned.push_str(&self.text[self.seg_start..self.seg_end]);
+            self.materialized = true;
+        }
+        self.owned.push(ch);
         self.seg_end = b;
     }
 
     /// Emit the accumulated `Text` span (if any) into the arena, linking
-    /// it onto `chain`, then reset to empty.
+    /// it onto `chain`, then reset to empty. A rewritten run is copied into
+    /// the bump; a pristine run borrows `text` directly.
     #[inline]
     fn flush(&mut self, ast: &mut Ast<'a>, chain: &mut Chain) {
-        match self.owned.take() {
-            Some(owned) => {
-                if !owned.is_empty() {
-                    let idx = ast.push_span(SpanKind::Text(Cow::Owned(owned)));
-                    chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
-                }
+        if self.materialized {
+            if !self.owned.is_empty() {
+                let s = ast.bump.alloc_str(&self.owned);
+                let idx = ast.push_span(SpanKind::Text(Cow::Borrowed(s)));
+                chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
             }
-            None => {
-                if self.seg_start < self.seg_end {
-                    let idx = ast.push_span(SpanKind::Text(Cow::Borrowed(
-                        &self.text[self.seg_start..self.seg_end],
-                    )));
-                    chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
-                }
-            }
+            // Keep the buffer; just end this run.
+            self.materialized = false;
+        } else if self.seg_start < self.seg_end {
+            let idx = ast.push_span(SpanKind::Text(Cow::Borrowed(
+                &self.text[self.seg_start..self.seg_end],
+            )));
+            chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
         }
         // Collapse to empty; the next push restarts at its own position.
         self.seg_start = self.seg_end;
@@ -4066,7 +4098,9 @@ mod byte_opt_tests {
     #[test]
     fn parse_image_cases() {
         // (verified byte-identical against kramdown 2.5.2)
-        let ast = Ast::new(); // empty defs ⇒ a reference image is undefined
+        let bump = Bump::new();
+        // empty defs ⇒ a reference image is undefined
+        let ast = Ast::with_capacity_for(0, &bump);
         let (src, alt, title, _) = parse_image(&ast, "![alt](/i.png)").unwrap().unwrap();
         assert_eq!((&*src, &*alt, title.as_deref()), ("/i.png", "alt", None));
 
