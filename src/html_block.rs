@@ -15,8 +15,10 @@
 //! exactly, no escaping, a trailing blank line as kramdown emits); the
 //! raw-content elements with bespoke whitespace/escaping rules (`pre`,
 //! `textarea`, `title`, `option`, `math`), comments, doctypes, processing
-//! instructions, a `markdown=` attribute, and any malformed / unclosed /
-//! mismatched structure all bail to `None`.
+//! instructions, a non-`"1"` `markdown=` attribute, and any malformed /
+//! unclosed / mismatched structure all bail to `None`. `markdown="1"` on an
+//! inline-content element (`p`/`h1`–`h6`) is supported: its content is parsed
+//! as markdown spans (the caller splices them into the emitted `\0` sentinel).
 
 use std::borrow::Cow;
 
@@ -59,6 +61,13 @@ fn is_escaped_raw(name: &str) -> bool {
 /// opening tag's attributes still re-serialize normally.
 fn is_raw_text(name: &str) -> bool {
     matches!(name, "script" | "style")
+}
+
+/// Elements whose `markdown="1"` content kramdown parses as SPAN markdown —
+/// inline-content elements (`p`, `h1`–`h6`). Block-content elements (`div`, …)
+/// would need block parsing and stay out of subset.
+fn is_span_content_md(name: &str) -> bool {
+    matches!(name, "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
 }
 
 /// Raw-content elements with bespoke whitespace / escaping rules we do NOT
@@ -157,6 +166,10 @@ struct Parser<'a> {
     b: &'a [u8],
     s: &'a str,
     pos: usize,
+    /// Raw content slices of `markdown="1"` elements, in the order their `\0`
+    /// sentinels appear in the output — each is parsed as markdown by the
+    /// caller and spliced back in at render.
+    md_content: Vec<&'a str>,
 }
 
 impl<'a> Parser<'a> {
@@ -267,7 +280,7 @@ impl<'a> Parser<'a> {
         out.push('<');
         out.push_str(&name);
         let attrs_mark = out.len();
-        let self_closed = self.attributes(out)?;
+        let (self_closed, markdown_1) = self.attributes(out)?;
         // Inject a leading block IAL's attributes onto the root tag. We only
         // support an element with NO attributes of its own (kramdown's IAL
         // merge — class accumulation, key override — onto existing attributes
@@ -296,34 +309,33 @@ impl<'a> Parser<'a> {
             // markdown, no nested-HTML parsing, no escaping — until the
             // matching close tag (the first `</name>`, case-insensitive).
             let content_start = self.pos;
-            loop {
-                while self.peek().is_some_and(|c| c != b'<') {
-                    self.pos += 1;
-                }
-                self.peek()?; // EOF before the close tag ⇒ unclosed, decline
-                if self.b.get(self.pos + 1) == Some(&b'/') {
-                    let after = &self.s[self.pos + 2..];
-                    if let Some(nend) = after
-                        .bytes()
-                        .position(|c| !(c.is_ascii_alphanumeric() || c == b'-'))
-                        && after[..nend].eq_ignore_ascii_case(&name)
-                    {
-                        let mut p = self.pos + 2 + nend;
-                        while self.b.get(p).is_some_and(|c| matches!(c, b' ' | b'\t')) {
-                            p += 1;
-                        }
-                        if self.b.get(p) == Some(&b'>') {
-                            out.push_str(&self.s[content_start..self.pos]);
-                            out.push_str("</");
-                            out.push_str(&name);
-                            out.push('>');
-                            self.pos = p + 1;
-                            return Some(());
-                        }
-                    }
-                }
-                self.pos += 1; // this `<` is raw content; keep scanning
+            let (content_end, after_close) = self.find_close(&name)?;
+            out.push_str(&self.s[content_start..content_end]);
+            out.push_str("</");
+            out.push_str(&name);
+            out.push('>');
+            self.pos = after_close;
+            return Some(());
+        }
+
+        if markdown_1 {
+            // `markdown="1"` on an inline-content element (`p`, `h1`–`h6`):
+            // kramdown parses the content as markdown SPANS. We capture the raw
+            // inner slice, emit a `\0` sentinel, and let the caller parse +
+            // splice it; block-content `markdown="1"` (e.g. on a `div`) needs
+            // block parsing and stays out of subset.
+            if !is_span_content_md(&name) {
+                return None;
             }
+            let content_start = self.pos;
+            let (content_end, after_close) = self.find_close(&name)?;
+            out.push('\0');
+            self.md_content.push(&self.s[content_start..content_end]);
+            out.push_str("</");
+            out.push_str(&name);
+            out.push('>');
+            self.pos = after_close;
+            return Some(());
         }
 
         // Normal content: text runs and nested elements until our close tag.
@@ -378,20 +390,54 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Serialize the attribute list, returning whether the tag self-closed
-    /// (`/>`). Leaves `pos` just past the `>`.
-    fn attributes(&mut self, out: &mut String) -> Option<bool> {
+    /// From `self.pos`, find the matching `</name>` close tag — the first
+    /// occurrence (case-insensitive, only whitespace allowed before its `>`).
+    /// Returns `(content_end, after_close)`: the byte index of the close tag's
+    /// `<` and the index just past its `>`. `None` if unclosed.
+    fn find_close(&self, name: &str) -> Option<(usize, usize)> {
+        let mut pos = self.pos;
+        loop {
+            while self.b.get(pos).is_some_and(|&c| c != b'<') {
+                pos += 1;
+            }
+            self.b.get(pos)?; // EOF before the close tag ⇒ unclosed
+            if self.b.get(pos + 1) == Some(&b'/') {
+                let after = &self.s[pos + 2..];
+                if let Some(nend) = after
+                    .bytes()
+                    .position(|c| !(c.is_ascii_alphanumeric() || c == b'-'))
+                    && after[..nend].eq_ignore_ascii_case(name)
+                {
+                    let mut p = pos + 2 + nend;
+                    while self.b.get(p).is_some_and(|c| matches!(c, b' ' | b'\t')) {
+                        p += 1;
+                    }
+                    if self.b.get(p) == Some(&b'>') {
+                        return Some((pos, p + 1));
+                    }
+                }
+            }
+            pos += 1; // this `<` is content; keep scanning
+        }
+    }
+
+    /// Serialize the attribute list, returning `(self_closed, markdown_1)`:
+    /// whether the tag self-closed (`/>`), and whether it carried
+    /// `markdown="1"` (which is consumed here, not written, and tells
+    /// [`element`] to parse the content as markdown). Leaves `pos` past the `>`.
+    fn attributes(&mut self, out: &mut String) -> Option<(bool, bool)> {
+        let mut markdown_1 = false;
         loop {
             self.skip_ws();
             match self.peek()? {
                 b'>' => {
                     self.pos += 1;
-                    return Some(false);
+                    return Some((false, markdown_1));
                 }
                 b'/' => {
                     if self.b.get(self.pos + 1) == Some(&b'>') {
                         self.pos += 2;
-                        return Some(true);
+                        return Some((true, markdown_1));
                     }
                     return None;
                 }
@@ -403,24 +449,33 @@ impl<'a> Parser<'a> {
                         self.pos += 1;
                     }
                     let aname = self.s[ns..self.pos].to_ascii_lowercase();
-                    // `markdown=` changes content parsing entirely — decline.
+                    self.skip_ws();
+                    // Read the value first so a `markdown=` attribute can branch
+                    // on it without being written to the tag.
+                    let value: Option<&str> = if self.peek() == Some(b'=') {
+                        self.pos += 1;
+                        self.skip_ws();
+                        let v = self.attr_value()?;
+                        if v.contains('\n') {
+                            return None; // newline-in-value normalization out of subset
+                        }
+                        Some(v)
+                    } else {
+                        None
+                    };
                     if aname == "markdown" {
+                        // `markdown="1"` → parse content as markdown; any other
+                        // value (`block`/`span`/…) is out of subset.
+                        if value == Some("1") {
+                            markdown_1 = true;
+                            continue;
+                        }
                         return None;
                     }
-                    self.skip_ws();
                     out.push(' ');
                     out.push_str(&aname);
                     out.push_str("=\"");
-                    if self.peek() == Some(b'=') {
-                        self.pos += 1;
-                        self.skip_ws();
-                        let value = self.attr_value()?;
-                        // A newline inside an attribute value is normalized
-                        // to a space by kramdown (`href="a\nb"` → `"a b"`);
-                        // we don't reproduce that, so decline.
-                        if value.contains('\n') {
-                            return None;
-                        }
+                    if let Some(value) = value {
                         Self::push_escaped_attr(out, value);
                     }
                     out.push('"');
@@ -575,6 +630,7 @@ pub(crate) fn inline_at(s: &str) -> Option<(Inline<'_>, usize)> {
         b: s.as_bytes(),
         s,
         pos: 0,
+        md_content: Vec::new(),
     };
     if p.peek() != Some(b'<') {
         return None;
@@ -604,6 +660,7 @@ pub(crate) fn inline_at(s: &str) -> Option<(Inline<'_>, usize)> {
             b: s.as_bytes(),
             s,
             pos: 0,
+            md_content: Vec::new(),
         };
         ep.element(&mut whole, &[])?;
         return Some((Inline::Raw(whole), ep.pos));
@@ -611,7 +668,10 @@ pub(crate) fn inline_at(s: &str) -> Option<(Inline<'_>, usize)> {
     let mut open = String::with_capacity(name.len() + 8);
     open.push('<');
     open.push_str(&name);
-    let self_closed = p.attributes(&mut open)?;
+    let (self_closed, markdown_1) = p.attributes(&mut open)?;
+    if markdown_1 {
+        return None; // markdown="1" on an inline element — out of subset
+    }
 
     if is_void(&name) {
         open.push_str(" />");
@@ -629,10 +689,14 @@ pub(crate) fn inline_at(s: &str) -> Option<(Inline<'_>, usize)> {
 }
 
 /// Serialize one top-level HTML block at the start of `src` (which begins at
-/// column 0 with a block-start tag). Returns the serialized HTML and the
-/// number of bytes consumed, requiring the close tag to land at a line
-/// boundary (end of input or a `\n`). `None` ⇒ out of subset → decline.
-pub(crate) fn serialize(src: &str, root_ial: &[(Cow<'_, str>, String)]) -> Option<(String, usize)> {
+/// column 0 with a block-start tag). Returns the serialized HTML, the number of
+/// bytes consumed, and the raw content slices of any `markdown="1"` elements
+/// (in `\0`-sentinel order, for the caller to parse as markdown and splice in),
+/// requiring the close tag to land at a line boundary. `None` ⇒ out of subset.
+pub(crate) fn serialize<'a>(
+    src: &'a str,
+    root_ial: &[(Cow<'_, str>, String)],
+) -> Option<(String, usize, Vec<&'a str>)> {
     // An HTML comment block: kramdown keeps the content verbatim (no markdown,
     // no escaping) up to the first `-->`, which must end at a line boundary.
     if let Some(rest) = src.strip_prefix("<!--") {
@@ -644,7 +708,7 @@ pub(crate) fn serialize(src: &str, root_ial: &[(Cow<'_, str>, String)]) -> Optio
         if src[close..].starts_with(|c| c != '\n') {
             return None; // trailing content on the close line is out of subset
         }
-        return Some((src[..close].to_string(), close));
+        return Some((src[..close].to_string(), close, Vec::new()));
     }
     // Must open with a block-start element.
     if !starts_html_block(src) {
@@ -654,6 +718,7 @@ pub(crate) fn serialize(src: &str, root_ial: &[(Cow<'_, str>, String)]) -> Optio
         b: src.as_bytes(),
         s: src,
         pos: 0,
+        md_content: Vec::new(),
     };
     let mut out = String::with_capacity(src.len() + 16);
     p.element(&mut out, root_ial)?;
@@ -678,7 +743,7 @@ pub(crate) fn serialize(src: &str, root_ial: &[(Cow<'_, str>, String)]) -> Optio
             }
         }
     }
-    Some((out, p.pos))
+    Some((out, p.pos, p.md_content))
 }
 
 /// kramdown autolink at the start of `s` (`s[0] == '<'`): `<scheme:…>` with
@@ -779,7 +844,7 @@ mod tests {
     }
 
     fn ser(s: &str) -> Option<String> {
-        serialize(s, &[]).map(|(h, _)| h)
+        serialize(s, &[]).map(|(h, _, _)| h)
     }
 
     #[test]

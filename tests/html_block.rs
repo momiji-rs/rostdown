@@ -178,6 +178,24 @@ fn html_comment_blocks_render_verbatim() {
 }
 
 #[test]
+fn markdown_attribute_parses_span_content() {
+    // `markdown="1"` on an inline-content element (`p`, `h1`–`h6`) parses the
+    // content as markdown SPANS: backtick code, emphasis, smart quotes. The
+    // attribute itself is dropped; the surrounding raw HTML is verbatim.
+    ok(
+        "<div class=\"note\">\n  <p markdown=\"1\">text with `code` and *em*</p>\n</div>\n",
+        "<div class=\"note\">\n  <p>text with <code>code</code> and <em>em</em></p>\n</div>\n",
+    );
+    ok(
+        "<h5 markdown=\"1\">Drafts don't wait</h5>\n",
+        "<h5>Drafts don\u{2019}t wait</h5>\n",
+    );
+    // Block-content `markdown="1"` (on a `div`) needs block parsing — out of
+    // subset, declines.
+    declined("<div markdown=\"1\">\n## heading\n</div>\n");
+}
+
+#[test]
 fn leading_block_ial_attaches_to_html_block() {
     // A block IAL on the line above an HTML block injects its attributes into
     // the block's root tag (kramdown attaches the IAL to the element).

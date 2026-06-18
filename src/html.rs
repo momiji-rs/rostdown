@@ -197,10 +197,26 @@ fn convert_blocks(
                 push_pad(out, indent);
                 out.push_str("<hr />\n");
             }
-            BlockKind::RawHtml(html) => {
+            BlockKind::RawHtml { html, md_spans } => {
                 // Already serialized to match kramdown's HTML converter
-                // (parsed at column 0, top level) — emit verbatim.
-                out.push_str(html);
+                // (parsed at column 0, top level). Each `\0` sentinel marks a
+                // `markdown="1"` element's content — splice the rendered
+                // markdown spans in their place.
+                if md_spans.is_empty() {
+                    out.push_str(html);
+                } else {
+                    let mut spans = md_spans.iter();
+                    let mut first = true;
+                    for segment in html.split('\0') {
+                        if !first
+                            && let Some(&head) = spans.next()
+                        {
+                            convert_spans(out, ast, head, hl.codespan_class());
+                        }
+                        out.push_str(segment);
+                        first = false;
+                    }
+                }
                 out.push('\n');
             }
             BlockKind::Table {

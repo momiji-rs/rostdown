@@ -169,8 +169,14 @@ pub(crate) enum BlockKind<'a> {
         text: Cow<'a, str>,
     },
     /// A raw HTML block, already re-serialized to match kramdown's HTML
-    /// converter (see [`crate::html_block`]). Emitted verbatim.
-    RawHtml(String),
+    /// converter (see [`crate::html_block`]). Emitted verbatim, EXCEPT each
+    /// `\0` sentinel in `html` marks where a `markdown="1"` element's content
+    /// — parsed as markdown spans — is spliced in at render; `md_spans` holds
+    /// those span heads in sentinel order (empty for the common block).
+    RawHtml {
+        html: String,
+        md_spans: Vec<Option<u32>>,
+    },
     Hr,
     /// A kramdown/GFM pipe table in the common shape: an optional header
     /// row (when a separator line underlines it), per-column alignment,
@@ -817,10 +823,19 @@ fn parse_blocks<'a>(
             // A buffered leading block IAL (`{: style=…}` on the line above)
             // attaches to this HTML block — `serialize` injects it into the
             // root tag, so consume it here rather than via `emit_block!`.
-            if let Some((html, consumed)) = crate::html_block::serialize(&src[off..], &pending_ial) {
+            if let Some((html, consumed, md_slices)) =
+                crate::html_block::serialize(&src[off..], &pending_ial)
+            {
                 let lines_used = 1 + src[off..off + consumed].bytes().filter(|&c| c == b'\n').count();
                 pending_ial.clear();
-                emit_block!(BlockKind::RawHtml(html));
+                // Each `markdown="1"` element's content is parsed as markdown
+                // spans now; `emit_toc`-style, the rendered spans splice into
+                // the `\0` sentinels at convert time.
+                let mut md_spans = Vec::with_capacity(md_slices.len());
+                for &slice in &md_slices {
+                    md_spans.push(parse_spans(ast, slice)?);
+                }
+                emit_block!(BlockKind::RawHtml { html, md_spans });
                 i += lines_used;
                 continue;
             }
