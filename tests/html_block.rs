@@ -135,8 +135,28 @@ fn table_family_reserialized() {
 fn out_of_subset_declines() {
     declined("<!-- a comment -->\n"); // comment
     declined("<div markdown=\"1\">\n**b**\n</div>\n"); // markdown= changes parsing
-    declined("<script>var x=1;</script>\n"); // raw, no-escape content
-    declined("<pre>\n  code\n</pre>\n"); // pre raw content
+    declined("<pre>\n  code\n</pre>\n"); // pre: bespoke whitespace rules
     declined("<div>unclosed\n"); // no close tag
     declined("<div>a</div> trailing\n"); // content after close on same line
+}
+
+#[test]
+fn raw_text_script_and_style_render_verbatim() {
+    // `<script>`/`<style>` content is kept verbatim — no markdown, no escaping
+    // of `<`/`>`/`&` — and kramdown always trails the block with a blank line.
+    ok(
+        "<script>\nif (a < b && c > d) f();\n</script>\n",
+        "<script>\nif (a < b && c > d) f();\n</script>\n\n",
+    );
+    ok(
+        "<style>\n.a > .b { color: red }\n</style>\n",
+        "<style>\n.a > .b { color: red }\n</style>\n\n",
+    );
+    // A following source blank line is absorbed (not emitted twice).
+    ok(
+        "<style>\n.x {}\n</style>\n\ntext\n",
+        "<style>\n.x {}\n</style>\n\n<p>text</p>\n",
+    );
+    // An unclosed raw-text element declines.
+    declined("<script>\nvar x = 1;\n");
 }

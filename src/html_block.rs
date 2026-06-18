@@ -10,8 +10,10 @@
 //! We reproduce a conservative subset and DECLINE the rest (so the document
 //! falls back to Ruby kramdown, never renders wrong): the block must start
 //! at column 0 with a block-level container element (including the `table`
-//! family and unknown/custom elements) and close at a line boundary;
-//! raw-content elements with bespoke escaping (`script`, `style`, `pre`,
+//! family and unknown/custom elements) and close at a line boundary. The
+//! verbatim raw-text elements `script`/`style` are supported (content kept
+//! exactly, no escaping, a trailing blank line as kramdown emits); the
+//! raw-content elements with bespoke whitespace/escaping rules (`pre`,
 //! `textarea`, `title`, `option`, `math`), comments, doctypes, processing
 //! instructions, a `markdown=` attribute, and any malformed / unclosed /
 //! mismatched structure all bail to `None`.
@@ -49,9 +51,17 @@ fn is_escaped_raw(name: &str) -> bool {
     matches!(name, "code" | "kbd" | "samp" | "var")
 }
 
-/// Raw-content elements kramdown serializes WITHOUT escaping (`<script>`,
-/// `<style>`, `<math>`) or with bespoke whitespace rules (`pre`, `textarea`,
-/// `title`, `option`). Out of subset — decline.
+/// Raw-text elements whose content kramdown keeps VERBATIM — no markdown, no
+/// nested-HTML parsing, no escaping (`<`/`>`/`&` pass through unchanged) — until
+/// the matching close tag. We reproduce `script`/`style` exactly this way; the
+/// opening tag's attributes still re-serialize normally.
+fn is_raw_text(name: &str) -> bool {
+    matches!(name, "script" | "style")
+}
+
+/// Raw-content elements with bespoke whitespace / escaping rules we do NOT
+/// reproduce (`math`'s MathML model; `pre`/`textarea`'s leading-newline strip;
+/// `title`/`option`). Out of subset — decline.
 ///
 /// The table family (`table`/`thead`/`tbody`/`tfoot`/`tr`/`td`/`th`/`caption`/
 /// `colgroup`) is NOT here: kramdown re-serializes those through the ordinary
@@ -59,10 +69,7 @@ fn is_escaped_raw(name: &str) -> bool {
 /// verbatim, markdown not parsed) — exactly what [`serialize`] produces — so
 /// they are in subset.
 fn is_decline_raw(name: &str) -> bool {
-    matches!(
-        name,
-        "script" | "style" | "math" | "textarea" | "title" | "option" | "pre"
-    )
+    matches!(name, "math" | "textarea" | "title" | "option" | "pre")
 }
 
 /// Whether `name` starts a top-level HTML BLOCK — a known block element
@@ -70,9 +77,10 @@ fn is_decline_raw(name: &str) -> bool {
 /// (`is-land`, `my-widget`, `sl-button`). kramdown treats both as a
 /// `:block`-content element at a block boundary (content verbatim, markdown
 /// not parsed, nested tags re-serialized) — exactly what [`serialize`]
-/// produces. EXCLUDED: known span/void elements (`<span>`/`<br>` at column 0
-/// are `<p>`-wrapped, out of subset) and raw-text elements (`<table>`,
-/// `<script>`, …, with a different content model).
+/// produces. Verbatim raw-text elements (`script`/`style`) are block starts
+/// too — [`element`] gives them the raw-content path. EXCLUDED: known
+/// span/void elements (`<span>`/`<br>` at column 0 are `<p>`-wrapped, out of
+/// subset) and the bespoke raw-content elements ([`is_decline_raw`]).
 fn is_block_start(name: &str) -> bool {
     !is_decline_raw(name) && !is_inline(name)
 }
@@ -234,6 +242,41 @@ impl<'a> Parser<'a> {
             return Some(());
         }
         out.push('>');
+
+        if is_raw_text(&name) {
+            // Raw-text element (`script`/`style`): content is verbatim — no
+            // markdown, no nested-HTML parsing, no escaping — until the
+            // matching close tag (the first `</name>`, case-insensitive).
+            let content_start = self.pos;
+            loop {
+                while self.peek().is_some_and(|c| c != b'<') {
+                    self.pos += 1;
+                }
+                self.peek()?; // EOF before the close tag ⇒ unclosed, decline
+                if self.b.get(self.pos + 1) == Some(&b'/') {
+                    let after = &self.s[self.pos + 2..];
+                    if let Some(nend) = after
+                        .bytes()
+                        .position(|c| !(c.is_ascii_alphanumeric() || c == b'-'))
+                        && after[..nend].eq_ignore_ascii_case(&name)
+                    {
+                        let mut p = self.pos + 2 + nend;
+                        while self.b.get(p).is_some_and(|c| matches!(c, b' ' | b'\t')) {
+                            p += 1;
+                        }
+                        if self.b.get(p) == Some(&b'>') {
+                            out.push_str(&self.s[content_start..self.pos]);
+                            out.push_str("</");
+                            out.push_str(&name);
+                            out.push('>');
+                            self.pos = p + 1;
+                            return Some(());
+                        }
+                    }
+                }
+                self.pos += 1; // this `<` is raw content; keep scanning
+            }
+        }
 
         // Normal content: text runs and nested elements until our close tag.
         // This includes `code`/`kbd`/`samp`/`var`: in block context kramdown
@@ -558,6 +601,22 @@ pub(crate) fn serialize(src: &str) -> Option<(String, usize)> {
     if p.pos != src.len() && src.as_bytes().get(p.pos) != Some(&b'\n') {
         return None;
     }
+    // A raw-text block (`script`/`style`) is always followed by a blank line
+    // in kramdown's output, regardless of the source. Bake the extra newline
+    // in and absorb one following source blank line so it isn't emitted twice.
+    if leading_tag_name(src).is_some_and(|n| is_raw_text(&n)) {
+        out.push('\n');
+        let bytes = src.as_bytes();
+        if bytes.get(p.pos) == Some(&b'\n') {
+            let next_start = p.pos + 1;
+            let next_end = src[next_start..]
+                .find('\n')
+                .map_or(src.len(), |x| next_start + x);
+            if src[next_start..next_end].trim().is_empty() {
+                p.pos = next_start; // consume the trailing blank line
+            }
+        }
+    }
     Some((out, p.pos))
 }
 
@@ -633,7 +692,11 @@ mod tests {
         assert!(is_void("img") && is_void("br") && is_void("hr"));
         assert!(!is_void("div") && !is_void("span"));
         assert!(is_escaped_raw("code") && !is_escaped_raw("div"));
-        assert!(is_decline_raw("script") && is_decline_raw("pre") && !is_decline_raw("table"));
+        assert!(is_raw_text("script") && is_raw_text("style") && !is_raw_text("div"));
+        assert!(is_decline_raw("pre") && is_decline_raw("math") && !is_decline_raw("table"));
+        assert!(!is_decline_raw("script") && !is_decline_raw("style"));
+        // raw-text elements are block starts (re-serialized verbatim).
+        assert!(is_block_start("script") && is_block_start("style"));
         assert!(is_block_start("div") && is_block_start("figure") && is_block_start("p"));
         // The table family is now a block start (re-serialized like a div).
         assert!(is_block_start("table") && is_block_start("td") && is_block_start("tr"));
@@ -687,6 +750,21 @@ mod tests {
             ser("<div><code><a href=\"u\">y</a></code></div>").as_deref(),
             Some("<div><code><a href=\"u\">y</a></code></div>")
         );
+        // raw-text (`script`/`style`): content verbatim (no escaping of
+        // `<`/`>`/`&`), attributes re-serialized, a trailing blank-line newline
+        // baked in (kramdown always trails a raw-text block with a blank line).
+        assert_eq!(
+            ser("<script>if (a < b && c > d) {}</script>").as_deref(),
+            Some("<script>if (a < b && c > d) {}</script>\n")
+        );
+        assert_eq!(
+            ser("<style>\n.x { color: red }\n</style>").as_deref(),
+            Some("<style>\n.x { color: red }\n</style>\n")
+        );
+        assert_eq!(
+            ser("<script type=\"text/javascript\">var x=1;</script>").as_deref(),
+            Some("<script type=\"text/javascript\">var x=1;</script>\n")
+        );
     }
 
     #[test]
@@ -696,6 +774,7 @@ mod tests {
         assert_eq!(ser("<div>unclosed"), None); // no close
         assert_eq!(ser("<div>a</div> trailing"), None); // trailing content
         assert_eq!(ser("<div>a</span>"), None); // mismatched close
-        assert_eq!(ser("<script>x</script>"), None); // raw no-escape
+        assert_eq!(ser("<script>x"), None); // unclosed raw-text
+        assert_eq!(ser("<pre>x</pre>"), None); // pre: bespoke whitespace, declined
     }
 }
