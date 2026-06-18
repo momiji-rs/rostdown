@@ -1600,6 +1600,12 @@ fn skip_html_tag(b: &[u8], i: usize) -> Option<usize> {
 fn split_table_cells(line: &str) -> Option<Vec<&str>> {
     let s = line.trim_matches([' ', '\t']);
     let b = s.as_bytes();
+    // Fast bail: no pipe anywhere ⇒ not a table row. `[u8]::contains` is
+    // memchr-backed, far cheaper than the byte-by-byte scan + the `cells`
+    // allocation below — and most lines (prose/code) have no pipe.
+    if !b.contains(&b'|') {
+        return None;
+    }
     let mut cells = Vec::new();
     let mut start = 0usize;
     let mut i = 0usize;
@@ -1861,6 +1867,10 @@ fn try_parse_table<'a>(
 /// unbalanced code span offers no protection — pipes around it still count.
 fn has_table_pipe(t: &str) -> bool {
     let b = t.as_bytes();
+    // Fast bail: no pipe at all ⇒ no table pipe (memchr, vs the scan below).
+    if !b.contains(&b'|') {
+        return false;
+    }
     let mut i = 0;
     let mut esc = false;
     while i < b.len() {
