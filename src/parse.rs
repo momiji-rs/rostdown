@@ -1022,6 +1022,7 @@ fn parse_blocks<'a>(
         if let (Some(fence_char), Some(lang)) =
             (fence_char.filter(|_| fence_len >= 3), fence_lang)
         {
+            let opener = i;
             i += 1;
             // Track the first/last CONTENT line so the body — every
             // content line plus its trailing `\n` — can be borrowed as
@@ -1071,34 +1072,37 @@ fn parse_blocks<'a>(
                 i += 1;
             }
             let body_end = i; // exclusive: content lines are [body_start, body_end)
-            if closed {
-                i += 1; // consume the closing fence line
-            }
             if !closed {
-                return Err(declined("unclosed-fence"));
-            }
-            let text = match first_body {
-                None => Cow::Borrowed(""),
-                Some(first) if contiguous => {
-                    // body = src[first.start ..= the `\n` after last] —
-                    // each content line plus one trailing newline. The
-                    // closing fence guarantees that final `\n` exists.
-                    let start = offset_in(src, first);
-                    let end = offset_in(src, last_body) + last_body.len() + 1;
-                    Cow::Borrowed(&src[start..end])
-                }
-                Some(_) => {
-                    // Non-contiguous: join each content line + `\n`.
-                    let mut body = String::with_capacity(64);
-                    for l in &lines[body_start..body_end] {
-                        body.push_str(l);
-                        body.push('\n');
+                // An unclosed fence is NOT code in kramdown — it falls back to
+                // an ordinary paragraph. Rewind to the opener and let the
+                // paragraph path (below) consume the lines (the opener's `~~~`
+                // run may then parse as `~~`-strikethrough, etc.).
+                i = opener;
+            } else {
+                i += 1; // consume the closing fence line
+                let text = match first_body {
+                    None => Cow::Borrowed(""),
+                    Some(first) if contiguous => {
+                        // body = src[first.start ..= the `\n` after last] —
+                        // each content line plus one trailing newline. The
+                        // closing fence guarantees that final `\n` exists.
+                        let start = offset_in(src, first);
+                        let end = offset_in(src, last_body) + last_body.len() + 1;
+                        Cow::Borrowed(&src[start..end])
                     }
-                    Cow::Owned(body)
-                }
-            };
-            emit_block!(BlockKind::Code { lang, text });
-            continue;
+                    Some(_) => {
+                        // Non-contiguous: join each content line + `\n`.
+                        let mut body = String::with_capacity(64);
+                        for l in &lines[body_start..body_end] {
+                            body.push_str(l);
+                            body.push('\n');
+                        }
+                        Cow::Owned(body)
+                    }
+                };
+                emit_block!(BlockKind::Code { lang, text });
+                continue;
+            }
         }
 
         // Blockquote: collect `>`-prefixed lines (plus lazy
@@ -1246,8 +1250,11 @@ fn parse_blocks<'a>(
                 && (l.starts_with('#')
                     || l.starts_with('>')
                     || list_marker(l).is_some()
-                    || l.starts_with("```")
-                    || l.starts_with("~~~")
+                    // A fence opener interrupts the paragraph only when the
+                    // fence actually CLOSES; an unclosed `~~~`/``` run stays
+                    // paragraph text (kramdown), parsing as strikethrough etc.
+                    || ((l.starts_with("```") || l.starts_with("~~~"))
+                        && fence_close_index(lines, i, opts).is_some())
                     || crate::html_block::starts_html_block(l))
             {
                 break;
@@ -1276,11 +1283,19 @@ fn parse_blocks<'a>(
                 // blockquote, and fence starts — they interrupt the
                 // paragraph, so end it here and let the block loop parse the
                 // opener. Core's paragraph_end is blank-only, so there the
-                // opener is out of subset (declines).
-                if opts.gfm {
-                    break;
+                // opener is out of subset (declines). EXCEPTION: a `~~~`/```
+                // fence opener interrupts only when the fence actually CLOSES;
+                // an unclosed run stays paragraph text (kramdown), where its
+                // tildes may parse as `~~`-strikethrough.
+                let st = l.trim_start_matches(' ');
+                let nonclosing_fence = (st.starts_with("```") || st.starts_with("~~~"))
+                    && fence_close_index(lines, i, opts).is_none();
+                if !nonclosing_fence {
+                    if opts.gfm {
+                        break;
+                    }
+                    return Err(declined("opt-space-block"));
                 }
-                return Err(declined("opt-space-block"));
             }
             // Setext underlines would silently turn this paragraph into
             // a heading — out of subset.
@@ -2084,6 +2099,49 @@ fn expand_leading_tabs(line: &str) -> String {
     }
     s.push_str(&line[tabs..]);
     s
+}
+
+/// If `lines[start]` is a valid fenced-code opener whose fence CLOSES at a
+/// later line, return that closing line's index; else `None`. The paragraph
+/// scanner uses this to decide whether a `~~~`/``` line ends the paragraph (a
+/// real, closed fence) or stays paragraph text (an unclosed run).
+fn fence_close_index(lines: &[&str], start: usize, opts: &Options) -> Option<usize> {
+    let line = lines[start];
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    let fline = if (indent == 0 || opts.gfm) && indent <= 3 {
+        &line[indent..]
+    } else {
+        line
+    };
+    let fc = match fline.as_bytes().first() {
+        Some(&b'`') if opts.gfm => b'`',
+        Some(&b'~') => b'~',
+        _ => return None,
+    };
+    let flen = run_len(fline.as_bytes(), 0, fc);
+    if flen < 3 {
+        return None;
+    }
+    // The info string must be a single `\S+` token (kramdown), with no backtick
+    // in a backtick fence — otherwise it is not a fence opener at all.
+    let rest = fline[flen..].trim_start();
+    let token = rest.split_whitespace().next().unwrap_or("");
+    if !rest[token.len()..].trim().is_empty() || (fc == b'`' && token.contains('`')) {
+        return None;
+    }
+    for (off, &l) in lines[start + 1..].iter().enumerate() {
+        let cl = if opts.gfm {
+            let b = l.trim_start_matches(' ');
+            if l.len() - b.len() <= 3 { b } else { l }
+        } else {
+            l
+        };
+        let t = trim_end_ws(cl);
+        if t.len() >= flen && t.bytes().all(|b| b == fc) {
+            return Some(start + 1 + off);
+        }
+    }
+    None
 }
 
 fn is_hr(line: &str) -> bool {
@@ -2956,18 +3014,21 @@ fn parse_spans_until<'a>(
                 }
             }
             b'~' if bytes.get(i + 1) == Some(&b'~') => {
-                // GFM strikethrough `~~text~~`. Like emphasis: opens unless
-                // the next char is a space; the close (generic stop check)
-                // needs non-empty content not preceded by a space. A run of
-                // 3+ tildes inline is a rarer kramdown form — decline.
-                if run_len(bytes, i, b'~') != 2 {
-                    return Err(declined("strikethrough"));
+                // GFM strikethrough. The delimiter is exactly 2 tildes; a run of
+                // N tildes keeps the extra `N-2` as LITERAL tildes outside the
+                // `<del>` (kramdown: `~~~x~~~` → `~<del>x</del>~`). Emit the
+                // leading literals, then open `~~` at the last two of the run.
+                let run = run_len(bytes, i, b'~');
+                let lit = run - 2; // run >= 2 (the arm guard requires `~~`)
+                if lit > 0 {
+                    acc.push_verbatim(i, i + lit);
                 }
-                let opens_on_space = text[i + 2..].chars().next().is_some_and(ruby_space);
+                let o = i + lit; // the opening `~~`
+                let opens_on_space = text[o + 2..].chars().next().is_some_and(ruby_space);
                 if parent == Some(Elem::Del) || opens_on_space {
-                    acc.push_verbatim(i, i + 2);
+                    acc.push_verbatim(o, o + 2);
                     prev = Some('~');
-                    i += 2;
+                    i = o + 2;
                     continue;
                 }
                 let attempt = Stop {
@@ -2978,7 +3039,7 @@ fn parse_spans_until<'a>(
                 let saved = ast.spans.len();
                 let (inner, close) = parse_spans_until(
                     ast,
-                    &text[i + 2..],
+                    &text[o + 2..],
                     Some(&attempt),
                     in_em,
                     in_strong,
@@ -2989,14 +3050,14 @@ fn parse_spans_until<'a>(
                     let idx = ast.push_span(SpanKind::Del(inner));
                     chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
                     prev = Some('~');
-                    i += 2 + close + 2;
+                    i = o + 2 + close + 2;
                     continue;
                 }
                 // No close: kramdown reverts to literal `~~`.
                 ast.spans.truncate(saved);
-                acc.push_verbatim(i, i + 2);
+                acc.push_verbatim(o, o + 2);
                 prev = Some('~');
-                i += 2;
+                i = o + 2;
             }
             b'{' if bytes.get(i + 1) == Some(&b':') => {
                 // Span IAL: `{:…}` immediately after a span element (no text

@@ -19,14 +19,6 @@ fn ok(src: &str, expected: &str) {
     }
 }
 
-#[track_caller]
-fn declined(src: &str) {
-    match render(src) {
-        Ok(html) => panic!("expected decline for {src:?}, got {html:?}"),
-        Err(Error::Declined(_)) => {}
-    }
-}
-
 #[test]
 fn three_closes_three() {
     ok(
@@ -96,11 +88,18 @@ fn info_string_is_a_single_token() {
         "<pre><code class=\"language-{:.cls}\">x\n</code></pre>\n",
     );
     ok("~~~c++ \nx\n~~~\n", "<pre><code class=\"language-c++\">x\n</code></pre>\n");
-    // A second token (internal whitespace) means it is NOT a fence opener —
-    // kramdown renders the line as a paragraph; we (still) decline rather than
-    // wrongly emit a `<pre>` with a truncated language.
-    declined("~~~ruby extra\nx\n~~~\n");
-    declined("~~~{% raw %}\ncode\n~~~\n");
+    // A second token (internal whitespace) means it is NOT a fence opener — the
+    // run isn't a closed fence, so kramdown renders the lines as one paragraph
+    // (the `~~~` runs stay literal: a closing `~~~` on its own line is preceded
+    // by a newline, so it can't close a strikethrough).
+    ok(
+        "~~~ruby extra\nx\n~~~\n",
+        "<p>~~~ruby extra\nx\n~~~</p>\n",
+    );
+    ok(
+        "~~~{% raw %}\ncode\n~~~\n",
+        "<p>~~~{% raw %}\ncode\n~~~</p>\n",
+    );
 }
 
 #[test]

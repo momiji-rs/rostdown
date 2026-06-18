@@ -17,14 +17,6 @@ fn ok(src: &str, expected: &str) {
     }
 }
 
-#[track_caller]
-fn declined(src: &str) {
-    match render(src) {
-        Ok(html) => panic!("expected decline for {src:?}, got {html:?}"),
-        Err(Error::Declined(_)) => {}
-    }
-}
-
 #[test]
 fn basic() {
     ok("a ~~struck~~ b\n", "<p>a <del>struck</del> b</p>\n");
@@ -54,6 +46,9 @@ fn flanking_and_literal_tildes() {
 }
 
 #[test]
-fn triple_tilde_inline_declines() {
-    declined("~~~x~~~\n");
+fn triple_tilde_inline_renders() {
+    // A run of N tildes keeps the extra N-2 as literal tildes OUTSIDE the
+    // `<del>` (kramdown): `~~~x~~~` → `~<del>x</del>~`.
+    ok("~~~x~~~\n", "<p>~<del>x</del>~</p>\n");
+    ok("~~~~x~~~~\n", "<p>~~<del>x</del>~~</p>\n");
 }
