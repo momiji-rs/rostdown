@@ -51,6 +51,20 @@ pub(crate) struct Ast<'a> {
     pub(crate) link_defs: LinkDefs<'a>,
     /// Span IAL attributes keyed by span index (see [`SpanIals`]).
     pub(crate) span_ials: SpanIals<'a>,
+    /// Table-of-contents entries, in document order, collected once at parse
+    /// time when a `{:toc}` list is present (empty otherwise). Each entry is a
+    /// heading's level, its (deduped) id, and its inline span head — rendered
+    /// by [`crate::html`]'s `emit_toc` in place of the `{:toc}` list.
+    pub(crate) toc: Vec<TocEntry>,
+}
+
+/// One table-of-contents entry — a heading's level, computed id, and inline
+/// span head (the text rendered inside the TOC link).
+#[derive(Debug)]
+pub(crate) struct TocEntry {
+    pub(crate) level: u8,
+    pub(crate) id: String,
+    pub(crate) spans: Option<u32>,
 }
 
 impl<'a> Ast<'a> {
@@ -72,6 +86,7 @@ impl<'a> Ast<'a> {
             items: Vec::with_capacity(src_len / 256 + 4),
             link_defs: HashMap::new(),
             span_ials: HashMap::new(),
+            toc: Vec::new(),
         }
     }
 
@@ -142,6 +157,10 @@ pub(crate) enum BlockKind<'a> {
         /// is wrapped in `<p>` (kramdown). Tight lists stay `<li>text</li>`.
         loose: bool,
         items: Option<u32>,
+        /// A `{:toc}` follows this list: kramdown replaces the list with a
+        /// generated table of contents (`<ul id="markdown-toc">…`). Rendered
+        /// from [`Ast::toc`] by `emit_toc` instead of the list's own items.
+        toc: bool,
     },
     /// Blockquote: index of the first child block (`None` ⇒ empty).
     Quote(Option<u32>),
@@ -325,6 +344,16 @@ pub(crate) fn parse<'a>(src: &'a str, opts: &Options) -> Result<(Ast<'a>, Option
             .collect();
         parse_blocks(&mut ast, src, &filtered, opts)?
     };
+    // When a `{:toc}` list is present, collect the document's headings once so
+    // `emit_toc` can render the table of contents in its place (and decline now
+    // if a heading holds a link we can't reproduce inside a TOC entry).
+    if ast
+        .blocks
+        .iter()
+        .any(|b| matches!(b.kind, BlockKind::List { toc: true, .. }))
+    {
+        ast.toc = collect_toc(&ast, root, opts)?;
+    }
     Ok((ast, root))
 }
 
@@ -524,6 +553,128 @@ fn parse_ial(content: &str) -> Option<Vec<(Cow<'_, str>, String)>> {
     if attrs.is_empty() { None } else { Some(attrs) }
 }
 
+/// Whether a block IAL's content is exactly kramdown's `toc` reference (a lone
+/// bare `toc` token, e.g. `{:toc}` / `{: toc }`). `parse_ial` rejects a bare
+/// reference, so this recognizes the table-of-contents marker separately. We
+/// accept only the plain form (no extra classes/ids), keeping the generated
+/// `<ul id="markdown-toc">` byte-identical; a `{:toc}` carrying other
+/// attributes falls through to the (declined) attribute path.
+fn is_toc_ial(content: &str) -> bool {
+    let mut it = content.split_whitespace();
+    it.next() == Some("toc") && it.next().is_none()
+}
+
+/// Whether a span chain (following `next` links and recursing into composite
+/// spans) contains a link. A heading with a link can't be reproduced verbatim
+/// inside a TOC entry (kramdown unwraps the link to its text), so a `{:toc}`
+/// document with such a heading declines rather than emit a nested `<a>`.
+fn span_chain_has_link(ast: &Ast<'_>, head: Option<u32>) -> bool {
+    let mut cur = head;
+    while let Some(idx) = cur {
+        let span = &ast.spans[idx as usize];
+        cur = span.next;
+        match &span.kind {
+            SpanKind::Link { .. } => return true,
+            SpanKind::Em(inner) | SpanKind::Strong(inner) | SpanKind::Del(inner)
+                if span_chain_has_link(ast, *inner) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Collect the table-of-contents entries (heading level, deduped id, inline
+/// span head) in document order, mirroring the HTML converter's traversal and
+/// id-dedup so the generated TOC links match the headings' own ids exactly.
+/// Recurses into list items and blockquotes (kramdown collects nested headings
+/// too) but skips a `{:toc}` list (it has no headings and the converter skips
+/// it). Declines when an in-TOC heading holds a link (see
+/// [`span_chain_has_link`]).
+fn collect_toc(ast: &Ast<'_>, root: Option<u32>, opts: &Options) -> Result<Vec<TocEntry>, Error> {
+    let mut used_ids: HashMap<String, u32> = HashMap::new();
+    let mut entries = Vec::new();
+    collect_toc_walk(ast, root, opts, &mut used_ids, &mut entries)?;
+    Ok(entries)
+}
+
+fn collect_toc_walk(
+    ast: &Ast<'_>,
+    head: Option<u32>,
+    opts: &Options,
+    used_ids: &mut HashMap<String, u32>,
+    entries: &mut Vec<TocEntry>,
+) -> Result<(), Error> {
+    let mut cur = head;
+    while let Some(idx) = cur {
+        let block = &ast.blocks[idx as usize];
+        cur = block.next;
+        match &block.kind {
+            BlockKind::Heading {
+                level,
+                raw,
+                span_text,
+                spans,
+            } => {
+                // Mirror the converter's id logic: an IAL id wins and does not
+                // touch the dedup counter; otherwise an auto id is slugged and
+                // deduped. With auto_ids off and no IAL id the heading has no
+                // id and is not in the TOC.
+                let ial_id = block.ial.iter().find(|(k, _)| k.as_ref() == "id");
+                let id = if let Some((_, v)) = ial_id {
+                    Some(v.clone())
+                } else if opts.auto_ids {
+                    let base = if opts.gfm {
+                        crate::html::gfm_slug(span_text)
+                            .unwrap_or_else(|| crate::html::basic_generate_id(raw))
+                    } else {
+                        crate::html::basic_generate_id(raw)
+                    };
+                    Some(crate::html::dedup_id(base, used_ids))
+                } else {
+                    None
+                };
+                // in_toc?: levels 1..6 (the default `toc_levels`) minus a
+                // `no_toc` class.
+                let no_toc = block
+                    .ial
+                    .iter()
+                    .find(|(k, _)| k.as_ref() == "class")
+                    .is_some_and(|(_, v)| v.split_whitespace().any(|w| w == "no_toc"));
+                if let Some(id) = id
+                    && (1..=6).contains(level)
+                    && !no_toc
+                {
+                    if span_chain_has_link(ast, *spans) {
+                        return Err(declined("toc-heading-link"));
+                    }
+                    entries.push(TocEntry {
+                        level: *level,
+                        id,
+                        spans: *spans,
+                    });
+                }
+            }
+            BlockKind::List { items, toc, .. } => {
+                if *toc {
+                    continue; // the {:toc} list itself holds no headings
+                }
+                let mut it = *items;
+                while let Some(iidx) = it {
+                    let item = &ast.items[iidx as usize];
+                    it = item.next;
+                    collect_toc_walk(ast, item.blocks, opts, used_ids, entries)?;
+                }
+            }
+            BlockKind::Quote(inner) => collect_toc_walk(ast, *inner, opts, used_ids, entries)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn parse_blocks<'a>(
     ast: &mut Ast<'a>,
     src: &'a str,
@@ -576,7 +727,24 @@ fn parse_blocks<'a>(
             && line.len() - line.trim_start_matches(' ').len() <= 3
         {
             let t = line.trim_matches([' ', '\t']);
-            if let Some(inner) = t.strip_prefix("{:").and_then(|s| s.strip_suffix('}'))
+            let inner_opt = t.strip_prefix("{:").and_then(|s| s.strip_suffix('}'));
+            // `{:toc}` directly after a list turns that list into kramdown's
+            // generated table of contents (rendered from `ast.toc`, built in
+            // `parse`). The bare `toc` reference is not a normal attribute, so
+            // `parse_ial` rejects it — handle it before the attribute path.
+            if let Some(inner) = inner_opt
+                && is_toc_ial(inner)
+                && let Some(last) = chain.last
+                && matches!(ast.blocks[last as usize].kind, BlockKind::List { .. })
+                && ast.blocks[last as usize].ial.is_empty()
+            {
+                if let BlockKind::List { toc, .. } = &mut ast.blocks[last as usize].kind {
+                    *toc = true;
+                }
+                i += 1;
+                continue;
+            }
+            if let Some(inner) = inner_opt
                 && let Some(attrs) = parse_ial(inner)
             {
                 // Trailing form: `block\n{:.x}` attaches to the PRECEDING
@@ -973,7 +1141,8 @@ fn parse_blocks<'a>(
             emit_block!(BlockKind::List {
                 ordered,
                 loose,
-                items
+                items,
+                toc: false,
             });
             continue;
         }
@@ -991,7 +1160,8 @@ fn parse_blocks<'a>(
             emit_block!(BlockKind::List {
                 ordered,
                 loose,
-                items
+                items,
+                toc: false,
             });
             continue;
         }

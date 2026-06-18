@@ -12,7 +12,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::parse::{Align, Ast, BlockKind, SpanKind};
+use crate::parse::{Align, Ast, BlockKind, SpanKind, TocEntry};
 use crate::{CodeHighlighter, Options};
 
 /// Run a highlighter callback with the bump arena paused (only when the
@@ -128,10 +128,15 @@ fn convert_blocks(
                 ordered,
                 loose,
                 items,
+                toc,
             } => {
-                emit_list(
-                    out, ast, *items, *ordered, *loose, &block.ial, indent, opts, hl, used_ids,
-                );
+                if *toc {
+                    emit_toc(out, ast, &block.ial, *ordered, indent, hl);
+                } else {
+                    emit_list(
+                        out, ast, *items, *ordered, *loose, &block.ial, indent, opts, hl, used_ids,
+                    );
+                }
             }
             BlockKind::Quote(inner) => {
                 push_pad(out, indent);
@@ -380,6 +385,135 @@ fn emit_list(
     out.push_str(">\n");
 }
 
+/// A node in the TOC nesting tree: an index into `Ast::toc` plus the tree-arena
+/// indices of its child entries.
+struct TocTreeNode {
+    entry: usize,
+    children: Vec<usize>,
+}
+
+/// Build the TOC nesting tree from the flat (document-order) entries with
+/// kramdown's stack algorithm: an entry nests under the nearest preceding
+/// entry of a strictly smaller level, else becomes a root. Returns the tree
+/// arena and the root indices.
+fn build_toc_tree(entries: &[TocEntry]) -> (Vec<TocTreeNode>, Vec<usize>) {
+    let mut tree: Vec<TocTreeNode> = Vec::with_capacity(entries.len());
+    let mut roots: Vec<usize> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    for (ei, e) in entries.iter().enumerate() {
+        let ni = tree.len();
+        tree.push(TocTreeNode {
+            entry: ei,
+            children: Vec::new(),
+        });
+        loop {
+            match stack.last().copied() {
+                None => {
+                    roots.push(ni);
+                    stack.push(ni);
+                    break;
+                }
+                Some(top) if entries[tree[top].entry].level < e.level => {
+                    tree[top].children.push(ni);
+                    stack.push(ni);
+                    break;
+                }
+                Some(_) => {
+                    stack.pop();
+                }
+            }
+        }
+    }
+    (tree, roots)
+}
+
+/// kramdown's `{:toc}` table of contents: the marked list is replaced by a
+/// `<ul id="markdown-toc">` of links to every heading, nested by level. The
+/// list's own IAL becomes the `<ul>` attributes, with `id` defaulting to
+/// `markdown-toc` (which also prefixes each entry's own anchor id).
+fn emit_toc(
+    out: &mut String,
+    ast: &Ast<'_>,
+    list_ial: &[(Cow<'_, str>, String)],
+    ordered: bool,
+    indent: usize,
+    hl: &mut dyn CodeHighlighter,
+) {
+    // No collected headings ⇒ kramdown substitutes the empty string, so the
+    // list contributes nothing.
+    if ast.toc.is_empty() {
+        return;
+    }
+    // The generated list keeps the `{:toc}` list's own type (`<ol>`/`<ul>`) —
+    // for the outer list and every nested level.
+    let tag = if ordered { "ol" } else { "ul" };
+    let mut list_attrs: Vec<(Cow<'_, str>, String)> = list_ial.to_vec();
+    let toc_id = match list_attrs.iter().find(|(k, _)| k.as_ref() == "id") {
+        Some((_, v)) => v.clone(),
+        None => {
+            list_attrs.push((Cow::Borrowed("id"), "markdown-toc".to_string()));
+            "markdown-toc".to_string()
+        }
+    };
+    let (tree, roots) = build_toc_tree(&ast.toc);
+    push_pad(out, indent);
+    out.push('<');
+    out.push_str(tag);
+    emit_attrs(out, &list_attrs);
+    out.push_str(">\n");
+    emit_toc_nodes(out, ast, &tree, &roots, &toc_id, tag, indent + 2, hl);
+    push_pad(out, indent);
+    out.push_str("</");
+    out.push_str(tag);
+    out.push_str(">\n");
+}
+
+/// Render a run of sibling TOC nodes as `<li>` items. Each item's leading
+/// paragraph is transparent (kramdown), so the link renders inline; a node
+/// with children carries a nested `<ul>` on the same line as its link, exactly
+/// as kramdown's converter lays it out.
+#[allow(clippy::too_many_arguments)]
+fn emit_toc_nodes(
+    out: &mut String,
+    ast: &Ast<'_>,
+    tree: &[TocTreeNode],
+    node_ids: &[usize],
+    toc_id: &str,
+    tag: &str,
+    li_indent: usize,
+    hl: &mut dyn CodeHighlighter,
+) {
+    for &ni in node_ids {
+        let node = &tree[ni];
+        let e = &ast.toc[node.entry];
+        push_pad(out, li_indent);
+        out.push_str("<li><a href=\"#");
+        escape_attr(out, &e.id);
+        out.push_str("\" id=\"");
+        out.push_str(toc_id);
+        out.push('-');
+        escape_attr(out, &e.id);
+        out.push_str("\">");
+        convert_spans(out, ast, e.spans, hl.codespan_class());
+        out.push_str("</a>");
+        if node.children.is_empty() {
+            out.push_str("</li>\n");
+        } else {
+            push_pad(out, li_indent + 2);
+            out.push('<');
+            out.push_str(tag);
+            out.push_str(">\n");
+            emit_toc_nodes(out, ast, tree, &node.children, toc_id, tag, li_indent + 4, hl);
+            push_pad(out, li_indent + 2);
+            out.push_str("</");
+            out.push_str(tag);
+            out.push_str(">\n");
+            push_pad(out, li_indent);
+            out.push_str("</li>\n");
+        }
+    }
+}
+
 fn convert_spans(out: &mut String, ast: &Ast<'_>, head: Option<u32>, codespan_class: Option<&str>) {
     let mut cur = head;
     while let Some(idx) = cur {
@@ -508,7 +642,7 @@ fn escape_attr(out: &mut String, text: &str) {
 /// kramdown CORE `Converter::Base#basic_generate_id`: strip leading
 /// non-ASCII-letters, delete everything outside `[a-zA-Z0-9 -]`,
 /// spaces → hyphens, downcase; empty → "section".
-fn basic_generate_id(raw: &str) -> String {
+pub(crate) fn basic_generate_id(raw: &str) -> String {
     let stripped = raw.trim_start_matches(|c: char| !c.is_ascii_alphabetic());
     let mut id = String::with_capacity(stripped.len());
     for ch in stripped.chars() {
@@ -608,7 +742,7 @@ pub(crate) fn gfm_slug_ok(span_text: &str) -> bool {
 /// Duplicate-id suffixing, shared by both algorithms (kramdown core's
 /// `@used_ids` and GFM's `@id_counter` behave identically): first use
 /// is bare, repeats get `-1`, `-2`, …
-fn dedup_id(id: String, used_ids: &mut HashMap<String, u32>) -> String {
+pub(crate) fn dedup_id(id: String, used_ids: &mut HashMap<String, u32>) -> String {
     match used_ids.get_mut(&id) {
         Some(count) => {
             *count += 1;
