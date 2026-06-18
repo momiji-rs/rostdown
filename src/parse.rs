@@ -2103,7 +2103,13 @@ fn parse_list_items<'a>(
             // Lines are borrowed from `src`; a TAB-indented continuation is
             // expanded to spaces (owned). If any owned line results, the item
             // is parsed via the deep-owning path so nothing borrows the temp.
-            let mut content: Vec<Cow<'a, str>> = vec![Cow::Borrowed(first)];
+            // Lines are `&'a str`: a `src` sub-slice, or — for a TAB-indented
+            // continuation expanded to spaces — a bump copy (`had_tab` then
+            // routes the whole item through the owned join, since bump slices
+            // aren't `src` sub-slices and break the contiguity arithmetic).
+            let bump = ast.bump;
+            let mut content: Vec<&'a str> = vec![first];
+            let mut had_tab = false;
             *i += 1;
             let mut internal_blank = false;
             // Once a shallow-indented (< content_col) line is kept verbatim, a
@@ -2124,7 +2130,7 @@ fn parse_list_items<'a>(
                     if nxt_indented {
                         // Internal blank(s): the item continues with another
                         // block at the content column — a multi-block item.
-                        content.resize(content.len() + (j - *i), Cow::Borrowed(""));
+                        content.resize(content.len() + (j - *i), "");
                         internal_blank = true;
                         *i = j;
                         continue;
@@ -2134,12 +2140,13 @@ fn parse_list_items<'a>(
                 // A pure leading-tab run expands to 4 spaces per tab (kramdown's
                 // content-line tab rule) so a TAB-indented continuation / nested
                 // list parses; the expanded line is owned.
-                let cl: Cow<'a, str> = if raw.as_bytes().first() == Some(&b'\t') {
-                    Cow::Owned(expand_leading_tabs(raw))
+                let cl: &'a str = if raw.as_bytes().first() == Some(&b'\t') {
+                    had_tab = true;
+                    bump.alloc_str(&expand_leading_tabs(raw))
                 } else {
-                    Cow::Borrowed(raw)
+                    raw
                 };
-                let cls: &str = &cl;
+                let cls: &str = cl;
                 let lead = cls.len() - cls.trim_start_matches(' ').len();
                 let trimmed = &cls[lead..];
                 if lead >= content_col {
@@ -2148,10 +2155,7 @@ fn parse_list_items<'a>(
                     if saw_shallow {
                         return Err(declined("list-continuation"));
                     }
-                    content.push(match &cl {
-                        Cow::Borrowed(s) => Cow::Borrowed(&s[content_col..]),
-                        Cow::Owned(s) => Cow::Owned(s[content_col..].to_string()),
-                    });
+                    content.push(&cl[content_col..]);
                     *i += 1;
                 } else if list_marker(trimmed) == Some(ordered) {
                     // A same-kind marker shallower than the content column is a
@@ -2188,22 +2192,14 @@ fn parse_list_items<'a>(
             while content.last().is_some_and(|c| c.is_empty()) {
                 content.pop();
             }
-            // Fast path: every line borrowed from `src` → parse in place.
-            // Otherwise (a tab-expanded line) parse over the owned lines and
-            // deep-own the result so nothing dangles.
-            let blocks = if content.iter().any(|c| matches!(c, Cow::Owned(_))) {
-                let owned: Vec<String> = content.iter().map(|c| c.clone().into_owned()).collect();
-                let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-                parse_blocks_owned(ast, &refs, opts)?
+            // Fast path: every line is a `src` sub-slice → parse in place.
+            // With a tab-expanded (bump) line, the lines aren't all `src`
+            // sub-slices, so route through the owned join (re-homes into one
+            // contiguous bump buffer).
+            let blocks = if had_tab {
+                parse_blocks_owned(ast, &content, opts)?
             } else {
-                let refs: Vec<&'a str> = content
-                    .iter()
-                    .map(|c| match c {
-                        Cow::Borrowed(s) => *s,
-                        Cow::Owned(_) => unreachable!(),
-                    })
-                    .collect();
-                parse_blocks(ast, src, &refs, opts)?
+                parse_blocks(ast, src, &content, opts)?
             };
             let idx = ast.push_item(ItemNode {
                 blocks,
