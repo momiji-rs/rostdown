@@ -861,7 +861,7 @@ fn parse_blocks<'a>(
             continue;
         }
 
-        decline_block_scan(line)?;
+        decline_block_scan(line, false)?;
 
         // ATX heading.
         if let Some(rest) = line.strip_prefix('#') {
@@ -1255,7 +1255,11 @@ fn parse_blocks<'a>(
                     return Err(declined("setext-heading"));
                 }
             }
-            decline_block_scan(l)?;
+            // A continuation line indented ≥4 spaces / tab is a lazy paragraph
+            // continuation (kept verbatim), not indented code — only the first
+            // line, which a real indented-code block would have claimed at the
+            // block loop, still rejects an indent here.
+            decline_block_scan(l, !first)?;
             if first {
                 // First line: drop OPT_SPACE indent (a sub-slice move).
                 first_line = Some(l.trim_start_matches(' '));
@@ -1819,8 +1823,14 @@ fn block_all_pipe(lines: &[&str], start: usize, opts: &Options) -> bool {
     true
 }
 
-fn decline_block_scan(line: &str) -> Result<(), Error> {
-    if line.as_bytes().starts_with(b"    ") || line.as_bytes().first() == Some(&b'\t') {
+/// `allow_indented` is set for a paragraph's CONTINUATION lines: a ≥4-space /
+/// tab indent there is a lazy continuation kept verbatim in the paragraph
+/// (kramdown only opens an indented code block at a block boundary, i.e. after
+/// a blank line), not an indented-code block — so it must not decline.
+fn decline_block_scan(line: &str, allow_indented: bool) -> Result<(), Error> {
+    if !allow_indented
+        && (line.as_bytes().starts_with(b"    ") || line.as_bytes().first() == Some(&b'\t'))
+    {
         return Err(declined("indented-code"));
     }
     let t = trim_start_ws(line);
@@ -3648,7 +3658,7 @@ mod byte_opt_tests {
     use super::*;
 
     fn reason(line: &str) -> Option<&'static str> {
-        match decline_block_scan(line) {
+        match decline_block_scan(line, false) {
             Ok(()) => None,
             Err(Error::Declined(r)) => Some(r),
         }

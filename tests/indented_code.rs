@@ -53,3 +53,26 @@ fn escaping_and_indent() {
 fn after_heading() {
     ok("# H\n    code\n", "<h1 id=\"h\">H</h1>\n<pre><code>code\n</code></pre>\n");
 }
+
+#[test]
+fn indented_continuation_is_paragraph_text_not_code() {
+    // A ≥4-space indent on a paragraph CONTINUATION line (no blank before it)
+    // is a lazy continuation kept verbatim — kramdown only opens an indented
+    // code block at a block boundary (after a blank). So this is one `<p>`,
+    // indentation and all, NOT a code block.
+    ok(
+        "text line\n    deeply indented continuation\nback\n",
+        "<p>text line\n    deeply indented continuation\nback</p>\n",
+    );
+    // The real-content shape: indented lines inside an unexpanded Liquid block
+    // are paragraph text, not code.
+    ok(
+        "{% highlight yaml %}\ncollections:\n  posts:\n    output: true\n{% endhighlight %}\n",
+        "<p>{% highlight yaml %}\ncollections:\n  posts:\n    output: true\n{% endhighlight %}</p>\n",
+    );
+    // But a genuine indented code block (after a blank line) still works.
+    ok(
+        "para\n\n    code line\n",
+        "<p>para</p>\n\n<pre><code>code line\n</code></pre>\n",
+    );
+}
