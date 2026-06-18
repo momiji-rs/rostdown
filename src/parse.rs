@@ -456,25 +456,6 @@ fn trim_start_ws(s: &str) -> &str {
     &s[i..]
 }
 
-/// `str::trim` (both ends) with an ASCII fast path; defers to the precise
-/// Unicode trim when a trim boundary lands on a non-ASCII byte.
-#[inline]
-fn trim_ws(s: &str) -> &str {
-    let b = s.as_bytes();
-    let mut start = 0;
-    while start < b.len() && b[start] < 0x80 && ascii_ws(b[start]) {
-        start += 1;
-    }
-    let mut end = b.len();
-    while end > start && b[end - 1] < 0x80 && ascii_ws(b[end - 1]) {
-        end -= 1;
-    }
-    if (start < b.len() && b[start] >= 0x80) || (end > start && b[end - 1] >= 0x80) {
-        return s.trim(); // non-ASCII at a boundary: be precise
-    }
-    &s[start..end]
-}
-
 /// `str::trim_end` with an ASCII fast path (non-ASCII boundary ⇒ defer to
 /// the Unicode-aware trim, which may strip more).
 #[inline]
@@ -2018,8 +1999,10 @@ fn is_hr(line: &str) -> bool {
     // An HR is one marker char (`-`/`*`/`_`) repeated >=3, plus spaces/
     // tabs — so the first non-space char fixes the only possible marker.
     // For prose (first char a letter) this bails on byte one, instead of
-    // the old three full `chars()` scans (one per candidate marker).
-    let t = trim_ws(line).as_bytes();
+    // the old three full `chars()` scans (one per candidate marker). Only
+    // the leading whitespace is trimmed: the count loop below already
+    // tolerates trailing spaces/tabs, so a `trim_end` pass would be wasted.
+    let t = trim_start_ws(line).as_bytes();
     let marker = match t.first() {
         Some(&c @ (b'-' | b'*' | b'_')) => c,
         _ => return false,

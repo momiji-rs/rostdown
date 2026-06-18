@@ -771,11 +771,26 @@ pub(crate) fn gfm_slug(span_text: &str) -> Option<String> {
 /// unsupported chars, and reject an all-deleted (would-be-empty) result.
 pub(crate) fn gfm_slug_ok(span_text: &str) -> bool {
     let mut non_empty = false;
-    for ch in span_text.chars() {
-        match slug_char(ch) {
-            SlugChar::Keep(_) => non_empty = true,
-            SlugChar::Drop => {}
-            SlugChar::Unsupported => return false,
+    let bytes = span_text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 0x80 {
+            // ASCII fast path (mirrors `slug_char`'s ASCII arms): word chars
+            // and space/tab are kept (non-empty), other punctuation dropped;
+            // ASCII never yields `Unsupported`.
+            if matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b' ' | b'\t') {
+                non_empty = true;
+            }
+            i += 1;
+        } else {
+            let ch = span_text[i..].chars().next().unwrap();
+            match slug_char(ch) {
+                SlugChar::Keep(_) => non_empty = true,
+                SlugChar::Drop => {}
+                SlugChar::Unsupported => return false,
+            }
+            i += ch.len_utf8();
         }
     }
     non_empty
