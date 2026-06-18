@@ -234,37 +234,40 @@ pub(crate) struct SpanNode<'a> {
     pub(crate) next: Option<u32>,
 }
 
+/// Span text is always a `&'a str` — a pristine `src` slice, or a bump
+/// copy for the few materialized cases (typography rewrites, re-serialized
+/// inline HTML). Holding `&str` rather than `Cow` keeps `SpanNode` a POD
+/// (`Copy`) type, so the span arena needs no per-node `Drop`.
 #[derive(Debug)]
 pub(crate) enum SpanKind<'a> {
-    /// Raw text (typography + escaping applied at conversion). Borrows a
-    /// pristine `src` slice unless a rewrite forced materialization.
-    Text(Cow<'a, str>),
+    /// Raw text (typography + escaping applied at conversion).
+    Text(&'a str),
     /// Verbatim HTML emitted without escaping — an inline raw-HTML element
     /// already re-serialized to match kramdown (see [`crate::html_block`]).
-    Raw(Cow<'a, str>),
+    Raw(&'a str),
     /// Emphasis: index of the first child span.
     Em(Option<u32>),
     /// GFM strikethrough (`~~…~~`): index of the first child span.
     Del(Option<u32>),
     /// Strong: index of the first child span.
     Strong(Option<u32>),
-    Code(Cow<'a, str>),
+    Code(&'a str),
     Link {
         /// Index of the first child span.
         spans: Option<u32>,
-        href: Cow<'a, str>,
+        href: &'a str,
         /// Optional `title="…"` from `[text](url "title")` / `'title'`.
         /// HTML-attr-escaped at conversion; `None` for the common
         /// no-title link.
-        title: Option<Cow<'a, str>>,
+        title: Option<&'a str>,
     },
     /// `![alt](src "title")` → `<img>`. `alt` is the raw bracket text
     /// (kramdown does not parse markup inside it); all three are
     /// HTML-attr-escaped at conversion.
     Image {
-        src: Cow<'a, str>,
-        alt: Cow<'a, str>,
-        title: Option<Cow<'a, str>>,
+        src: &'a str,
+        alt: &'a str,
+        title: Option<&'a str>,
     },
 }
 
@@ -947,7 +950,7 @@ fn parse_blocks<'a>(
                             && matches!(ast.spans[first as usize].kind, SpanKind::Text(_)) =>
                     {
                         match &ast.spans[first as usize].kind {
-                            SpanKind::Text(t) => t.clone(),
+                            SpanKind::Text(t) => Cow::Borrowed(*t),
                             _ => unreachable!(),
                         }
                     }
@@ -2531,15 +2534,13 @@ impl<'a> TextRun<'a> {
         if self.materialized {
             if !self.owned.is_empty() {
                 let s = ast.bump.alloc_str(&self.owned);
-                let idx = ast.push_span(SpanKind::Text(Cow::Borrowed(s)));
+                let idx = ast.push_span(SpanKind::Text(s));
                 chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
             }
             // Keep the buffer; just end this run.
             self.materialized = false;
         } else if self.seg_start < self.seg_end {
-            let idx = ast.push_span(SpanKind::Text(Cow::Borrowed(
-                &self.text[self.seg_start..self.seg_end],
-            )));
+            let idx = ast.push_span(SpanKind::Text(&self.text[self.seg_start..self.seg_end]));
             chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
         }
         // Collapse to empty; the next push restarts at its own position.
@@ -2610,7 +2611,7 @@ fn parse_spans_until<'a>(
                 // break (kramdown), like trailing double-space.
                 if next == '\n' {
                     acc.flush(ast, &mut chain);
-                    let br = ast.push_span(SpanKind::Raw(Cow::Borrowed("<br />")));
+                    let br = ast.push_span(SpanKind::Raw("<br />"));
                     chain.link(br, |q, n| ast.spans[q as usize].next = Some(n));
                     prev = Some('\n');
                     i += 1; // consume the `\`; the `\n` stays as joined text
@@ -2664,7 +2665,7 @@ fn parse_spans_until<'a>(
                     inner = inner.strip_prefix(' ').unwrap_or(inner);
                     inner = inner.strip_suffix(' ').unwrap_or(inner);
                 }
-                let idx = ast.push_span(SpanKind::Code(Cow::Borrowed(inner)));
+                let idx = ast.push_span(SpanKind::Code(inner));
                 chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
                 prev = Some('`');
                 i += open + close_rel + open;
@@ -2800,7 +2801,8 @@ fn parse_spans_until<'a>(
                 // digit).
                 if let Some((html, len)) = crate::html_block::autolink_at(&text[i..]) {
                     acc.flush(ast, &mut chain);
-                    let idx = ast.push_span(SpanKind::Raw(Cow::Owned(html)));
+                    let h = ast.bump.alloc_str(&html);
+                    let idx = ast.push_span(SpanKind::Raw(h));
                     chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
                     prev = Some('>');
                     i += len;
@@ -2818,7 +2820,8 @@ fn parse_spans_until<'a>(
                 {
                     acc.flush(ast, &mut chain);
                     let push_raw = |ast: &mut Ast<'a>, chain: &mut Chain, s: String| {
-                        let idx = ast.push_span(SpanKind::Raw(Cow::Owned(s)));
+                        let h = ast.bump.alloc_str(&s);
+                        let idx = ast.push_span(SpanKind::Raw(h));
                         chain.link(idx, |p, n| ast.spans[p as usize].next = Some(n));
                     };
                     match el {
@@ -3063,7 +3066,7 @@ fn parse_spans_until<'a>(
                     if sp >= 2 {
                         acc.push_verbatim(seg, nl - 2);
                         acc.flush(ast, &mut chain);
-                        let br = ast.push_span(SpanKind::Raw(Cow::Borrowed("<br />")));
+                        let br = ast.push_span(SpanKind::Raw("<br />"));
                         chain.link(br, |q, n| ast.spans[q as usize].next = Some(n));
                         seg = nl; // drop the two spaces; keep the newline
                     }
@@ -3472,7 +3475,7 @@ fn collect_link_defs<'a>(lines: &[&'a str]) -> Result<(LinkDefs<'a>, Vec<bool>),
 fn parse_image<'a>(
     ast: &Ast<'a>,
     rest: &'a str,
-) -> Result<Option<(Cow<'a, str>, Cow<'a, str>, Option<Cow<'a, str>>, usize)>, Error> {
+) -> Result<Option<(&'a str, &'a str, Option<&'a str>, usize)>, Error> {
     let bytes = rest.as_bytes();
     debug_assert!(bytes.starts_with(b"!["));
     // Closing `]` of the alt. Escaped / nested brackets are out of subset.
@@ -3523,9 +3526,9 @@ fn parse_image<'a>(
             return Ok(None);
         };
         return Ok(Some((
-            Cow::Borrowed(src),
-            Cow::Borrowed(alt),
-            title.map(Cow::Borrowed),
+            src,
+            alt,
+            title,
             consumed,
         )));
     }
@@ -3540,9 +3543,9 @@ fn parse_image<'a>(
         return Err(declined("image-dest"));
     }
     Ok(Some((
-        Cow::Borrowed(src),
-        Cow::Borrowed(&rest[2..close]),
-        title.map(Cow::Borrowed),
+        src,
+        &rest[2..close],
+        title,
         close + 2 + paren_rel + 1,
     )))
 }
@@ -3557,7 +3560,7 @@ fn parse_link<'a>(
     rest: &'a str,
     in_em: bool,
     in_strong: bool,
-) -> Result<Option<(Option<u32>, Cow<'a, str>, Option<Cow<'a, str>>, usize)>, Error> {
+) -> Result<Option<(Option<u32>, &'a str, Option<&'a str>, usize)>, Error> {
     let bytes = rest.as_bytes();
     debug_assert_eq!(bytes[0], b'[');
     // Find the closing `]`. Escaped brackets (`\]`/`\[`) and nested
@@ -3694,8 +3697,8 @@ fn parse_link<'a>(
     // `href`/`title` are sub-slices of `rest` (the link source) — borrow.
     Ok(Some((
         spans,
-        Cow::Borrowed(href),
-        title.map(Cow::Borrowed),
+        href,
+        title,
         link_end,
     )))
 }
@@ -3712,7 +3715,7 @@ fn resolve_ref_link<'a>(
     close: usize,
     in_em: bool,
     in_strong: bool,
-) -> Result<Option<(Option<u32>, Cow<'a, str>, Option<Cow<'a, str>>, usize)>, Error> {
+) -> Result<Option<(Option<u32>, &'a str, Option<&'a str>, usize)>, Error> {
     let bytes = rest.as_bytes();
     let text = &rest[1..close];
     let (id, consumed) = match bytes.get(close + 1) {
@@ -3747,8 +3750,8 @@ fn resolve_ref_link<'a>(
         parse_spans_until(ast, text, None, in_em, in_strong, Some(Elem::Link))?;
     Ok(Some((
         spans,
-        Cow::Borrowed(href),
-        title.map(Cow::Borrowed),
+        href,
+        title,
         consumed,
     )))
 }
@@ -3947,17 +3950,17 @@ mod byte_opt_tests {
         // empty defs ⇒ a reference image is undefined
         let ast = Ast::with_capacity_for(0, &bump);
         let (src, alt, title, _) = parse_image(&ast, "![alt](/i.png)").unwrap().unwrap();
-        assert_eq!((&*src, &*alt, title.as_deref()), ("/i.png", "alt", None));
+        assert_eq!((src, alt, title), ("/i.png", "alt", None));
 
         let (src, alt, title, _) = parse_image(&ast, r#"![a](/i.png "t")"#).unwrap().unwrap();
-        assert_eq!((&*src, &*alt, title.as_deref()), ("/i.png", "a", Some("t")));
+        assert_eq!((src, alt, title), ("/i.png", "a", Some("t")));
 
         let (src, alt, _, _) = parse_image(&ast, "![](u)").unwrap().unwrap();
-        assert_eq!((&*src, &*alt), ("u", ""));
+        assert_eq!((src, alt), ("u", ""));
 
         // raw alt keeps markup literal (kramdown does not parse it)
         let (_, alt, _, _) = parse_image(&ast, "![a *b* c](u)").unwrap().unwrap();
-        assert_eq!(&*alt, "a *b* c");
+        assert_eq!(alt, "a *b* c");
 
         // reference-style image with no matching definition ⇒ not inline
         assert!(parse_image(&ast, "![a][r]").unwrap().is_none());
