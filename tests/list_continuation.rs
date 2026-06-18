@@ -208,8 +208,23 @@ fn declines_irregular_indentation() {
     // A 1-space-indented MARKER is a same-level sibling kramdown keeps but we
     // don't model (off the list's own indent).
     declined("- a\n - b\n");
-    // Tab indentation.
-    declined("- a\n\tb\n");
+}
+
+#[test]
+fn tab_indented_continuation_and_nested_list() {
+    // kramdown expands a leading tab to 4 spaces (its list content-line rule),
+    // so a TAB-indented continuation joins the item (de-indented to the content
+    // column) and a TAB-indented marker becomes a nested list.
+    ok("- a\n\tb\n", "<ul>\n  <li>a\n  b</li>\n</ul>\n");
+    ok(
+        "* parent\n\t* child\n",
+        "<ul>\n  <li>parent\n    <ul>\n      <li>child</li>\n    </ul>\n  </li>\n</ul>\n",
+    );
+    ok(
+        "* parent\n\t* child\n* sibling\n",
+        "<ul>\n  <li>parent\n    <ul>\n      <li>child</li>\n    </ul>\n  </li>\n  \
+           <li>sibling</li>\n</ul>\n",
+    );
 }
 
 #[test]

@@ -1421,6 +1421,123 @@ fn copy_spans_owned<'a>(dst: &mut Ast<'a>, scratch: &Ast<'_>, head: Option<u32>)
     chain.first()
 }
 
+/// Parse `joined` (a temporary `String` that does NOT outlive the AST) into
+/// block content in the main arena, deep-owning every `Cow` so nothing borrows
+/// the temporary. The block-level analogue of [`parse_spans_owned`] — used when
+/// a list item's content had to be rebuilt with owned strings (a TAB-indented
+/// continuation expanded to spaces).
+fn parse_blocks_owned<'a>(ast: &mut Ast<'a>, lines: &[&str], opts: &Options) -> Result<Option<u32>, Error> {
+    // Join into ONE contiguous buffer and re-split, so every line is a real
+    // sub-slice of `joined` and the scratch parse's offset/contiguity
+    // arithmetic holds. The result is deep-owned, so nothing borrows `joined`.
+    let joined: String = lines.join("\n");
+    let split: Vec<&str> = joined.split('\n').collect();
+    let mut scratch: Ast<'_> = Ast::new();
+    scratch.link_defs = ast
+        .link_defs
+        .iter()
+        .map(|(k, &(url, title))| (k.clone(), (url, title)))
+        .collect();
+    let head = parse_blocks(&mut scratch, &joined, &split, opts)?;
+    Ok(copy_blocks_owned(ast, &scratch, head))
+}
+
+/// Deep-own an IAL list (used by [`copy_blocks_owned`]).
+fn own_ial<'a>(ial: &[(Cow<'_, str>, String)]) -> Vec<(Cow<'a, str>, String)> {
+    ial.iter()
+        .map(|(k, v)| (Cow::Owned(k.clone().into_owned()), v.clone()))
+        .collect()
+}
+
+/// Copy the block chain at `head` from `scratch` into `dst`, deep-owning every
+/// `Cow` (text, ial, span/item children) so nothing borrows `scratch`. Returns
+/// the head index in `dst`.
+fn copy_blocks_owned<'a>(dst: &mut Ast<'a>, scratch: &Ast<'_>, head: Option<u32>) -> Option<u32> {
+    let mut chain = Chain::new();
+    let mut cur = head;
+    while let Some(idx) = cur {
+        let node = &scratch.blocks[idx as usize];
+        let kind = match &node.kind {
+            BlockKind::Blank => BlockKind::Blank,
+            BlockKind::Hr => BlockKind::Hr,
+            BlockKind::Para(spans) => BlockKind::Para(copy_spans_owned(dst, scratch, *spans)),
+            BlockKind::Heading {
+                level,
+                raw,
+                span_text,
+                spans,
+            } => BlockKind::Heading {
+                level: *level,
+                raw: Cow::Owned(raw.clone().into_owned()),
+                span_text: Cow::Owned(span_text.clone().into_owned()),
+                spans: copy_spans_owned(dst, scratch, *spans),
+            },
+            BlockKind::Quote(inner) => BlockKind::Quote(copy_blocks_owned(dst, scratch, *inner)),
+            BlockKind::Code { lang, text } => BlockKind::Code {
+                lang: lang.as_ref().map(|l| Cow::Owned(l.clone().into_owned())),
+                text: Cow::Owned(text.clone().into_owned()),
+            },
+            BlockKind::RawHtml { html, md_spans } => BlockKind::RawHtml {
+                html: html.clone(),
+                md_spans: md_spans
+                    .iter()
+                    .map(|&h| copy_spans_owned(dst, scratch, h))
+                    .collect(),
+            },
+            BlockKind::List {
+                ordered,
+                loose,
+                items,
+                toc,
+            } => BlockKind::List {
+                ordered: *ordered,
+                loose: *loose,
+                items: copy_items_owned(dst, scratch, *items),
+                toc: *toc,
+            },
+            BlockKind::Table {
+                aligns,
+                header,
+                body,
+            } => BlockKind::Table {
+                aligns: aligns.clone(),
+                header: header
+                    .as_ref()
+                    .map(|h| h.iter().map(|&c| copy_spans_owned(dst, scratch, c)).collect()),
+                body: body
+                    .iter()
+                    .map(|row| row.iter().map(|&c| copy_spans_owned(dst, scratch, c)).collect())
+                    .collect(),
+            },
+        };
+        let new_idx = dst.push_block(kind);
+        dst.blocks[new_idx as usize].ial = own_ial(&node.ial);
+        chain.link(new_idx, |p, n| dst.blocks[p as usize].next = Some(n));
+        cur = node.next;
+    }
+    chain.first()
+}
+
+/// Copy the item chain at `head` from `scratch` into `dst`, deep-owning every
+/// child block (see [`copy_blocks_owned`]). Returns the head index in `dst`.
+fn copy_items_owned<'a>(dst: &mut Ast<'a>, scratch: &Ast<'_>, head: Option<u32>) -> Option<u32> {
+    let mut chain = Chain::new();
+    let mut cur = head;
+    while let Some(idx) = cur {
+        let node = &scratch.items[idx as usize];
+        let blocks = copy_blocks_owned(dst, scratch, node.blocks);
+        let new_idx = dst.push_item(ItemNode {
+            blocks,
+            next: None,
+            transparent: node.transparent,
+            _marker: std::marker::PhantomData,
+        });
+        chain.link(new_idx, |p, n| dst.items[p as usize].next = Some(n));
+        cur = node.next;
+    }
+    chain.first()
+}
+
 /// If `b[i]` opens a well-formed inline HTML tag (`<` then a letter or `/`,
 /// closing at a `>` on the same line, with `"`/`'` attribute values spanned),
 /// return the index just past the `>`; else `None`. Used by [`has_table_pipe`]
@@ -1955,6 +2072,20 @@ fn decline_eol(last: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Expand a PURE leading-tab run to spaces, 4 per tab — kramdown's list
+/// content-line tab rule (`result.sub!(/^(\t+)/) { " " * 4 * $1.length }`). A
+/// line that mixes leading spaces and tabs is left to the caller (it is not a
+/// pure-tab line and falls outside this expansion).
+fn expand_leading_tabs(line: &str) -> String {
+    let tabs = line.len() - line.trim_start_matches('\t').len();
+    let mut s = String::with_capacity(line.len() + tabs * 3);
+    for _ in 0..tabs {
+        s.push_str("    ");
+    }
+    s.push_str(&line[tabs..]);
+    s
+}
+
 fn is_hr(line: &str) -> bool {
     // An HR is one marker char (`-`/`*`/`_`) repeated >=3, plus spaces/
     // tabs — so the first non-space char fixes the only possible marker.
@@ -2050,7 +2181,10 @@ fn parse_list_items<'a>(
             let first = strip_marker(&l[base..], ordered);
             // Absolute content column = base + marker width.
             let content_col = l.len() - first.len();
-            let mut content: Vec<&'a str> = vec![first];
+            // Lines are borrowed from `src`; a TAB-indented continuation is
+            // expanded to spaces (owned). If any owned line results, the item
+            // is parsed via the deep-owning path so nothing borrows the temp.
+            let mut content: Vec<Cow<'a, str>> = vec![Cow::Borrowed(first)];
             *i += 1;
             let mut internal_blank = false;
             // Once a shallow-indented (< content_col) line is kept verbatim, a
@@ -2059,8 +2193,8 @@ fn parse_list_items<'a>(
             // separate lists) — ambiguous, so decline the mix.
             let mut saw_shallow = false;
             while *i < lines.len() {
-                let cl = lines[*i];
-                if is_blank(cl) {
+                let raw = lines[*i];
+                if is_blank(raw) {
                     let mut j = *i;
                     while j < lines.len() && is_blank(lines[j]) {
                         j += 1;
@@ -2071,25 +2205,34 @@ fn parse_list_items<'a>(
                     if nxt_indented {
                         // Internal blank(s): the item continues with another
                         // block at the content column — a multi-block item.
-                        content.resize(content.len() + (j - *i), "");
+                        content.resize(content.len() + (j - *i), Cow::Borrowed(""));
                         internal_blank = true;
                         *i = j;
                         continue;
                     }
                     break; // trailing blank → the outer loop classifies it
                 }
-                if cl.as_bytes().first() == Some(&b'\t') {
-                    return Err(declined("list-tab-indent"));
-                }
-                let lead = cl.len() - cl.trim_start_matches(' ').len();
-                let trimmed = &cl[lead..];
+                // A pure leading-tab run expands to 4 spaces per tab (kramdown's
+                // content-line tab rule) so a TAB-indented continuation / nested
+                // list parses; the expanded line is owned.
+                let cl: Cow<'a, str> = if raw.as_bytes().first() == Some(&b'\t') {
+                    Cow::Owned(expand_leading_tabs(raw))
+                } else {
+                    Cow::Borrowed(raw)
+                };
+                let cls: &str = &cl;
+                let lead = cls.len() - cls.trim_start_matches(' ').len();
+                let trimmed = &cls[lead..];
                 if lead >= content_col {
                     // Content line: strip the content column (a deeper indent
                     // keeps its residual spaces, like kramdown).
                     if saw_shallow {
                         return Err(declined("list-continuation"));
                     }
-                    content.push(&cl[content_col..]);
+                    content.push(match &cl {
+                        Cow::Borrowed(s) => Cow::Borrowed(&s[content_col..]),
+                        Cow::Owned(s) => Cow::Owned(s[content_col..].to_string()),
+                    });
                     *i += 1;
                 } else if list_marker(trimmed) == Some(ordered) {
                     // A same-kind marker shallower than the content column is a
@@ -2123,10 +2266,26 @@ fn parse_list_items<'a>(
             if internal_blank {
                 loose = true;
             }
-            while content.last() == Some(&"") {
+            while content.last().is_some_and(|c| c.is_empty()) {
                 content.pop();
             }
-            let blocks = parse_blocks(ast, src, &content, opts)?;
+            // Fast path: every line borrowed from `src` → parse in place.
+            // Otherwise (a tab-expanded line) parse over the owned lines and
+            // deep-own the result so nothing dangles.
+            let blocks = if content.iter().any(|c| matches!(c, Cow::Owned(_))) {
+                let owned: Vec<String> = content.iter().map(|c| c.clone().into_owned()).collect();
+                let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+                parse_blocks_owned(ast, &refs, opts)?
+            } else {
+                let refs: Vec<&'a str> = content
+                    .iter()
+                    .map(|c| match c {
+                        Cow::Borrowed(s) => *s,
+                        Cow::Owned(_) => unreachable!(),
+                    })
+                    .collect();
+                parse_blocks(ast, src, &refs, opts)?
+            };
             let idx = ast.push_item(ItemNode {
                 blocks,
                 next: None,

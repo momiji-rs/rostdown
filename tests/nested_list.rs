@@ -115,8 +115,11 @@ fn ordered_parent_nested_child() {
 
 #[test]
 fn conservative_declines_hold() {
-    // Tab indentation — declined.
-    declined("- a\n\t- b\n");
+    // A TAB-indented child is now nested (kramdown expands the tab to 4 spaces).
+    ok(
+        "- a\n\t- b\n",
+        "<ul>\n  <li>a\n    <ul>\n      <li>b</li>\n    </ul>\n  </li>\n</ul>\n",
+    );
     // 1-space indent is a SAME-level item in kramdown — declined.
     declined("- a\n - b\n");
 }
