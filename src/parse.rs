@@ -350,7 +350,13 @@ pub(crate) fn parse<'a>(
     // Pre-pass: lift block-level link reference definitions out of the
     // stream so the surrounding blank lines collapse the way kramdown's
     // do, and so `[text][id]` / `[text]` resolve during span parsing.
-    let (defs, def_mask) = collect_link_defs(lines)?;
+    // A definition (and the malformed-def decline) requires `]:`, so a
+    // document without that pair anywhere skips the whole per-line scan.
+    let (defs, def_mask) = if src.contains("]:") {
+        collect_link_defs(lines)?
+    } else {
+        (LinkDefs::new(), Vec::new())
+    };
     let root = if defs.is_empty() {
         parse_blocks(&mut ast, src, lines, opts)?
     } else {
