@@ -1387,191 +1387,35 @@ fn parse_blocks<'a>(
     Ok(chain.first())
 }
 
-/// Parse `joined` (a temporary `String` that does NOT outlive the AST)
-/// into the main arena, deep-owning every text `Cow` so no span borrows
-/// the temporary. Used for the rare owned-text paragraph fallback
-/// (blockquote / list bodies whose de-prefixed source lines don't abut
-/// contiguously). Parses into a scratch [`Ast`], then copies the chain
-/// in, remapping indices and `into_owned`-ing the Cows.
-fn parse_spans_owned<'a, 'j>(
-    ast: &mut Ast<'a>,
-    joined: &'j str,
-) -> Result<Option<u32>, Error>
-where
-    'a: 'j,
-{
-    // The scratch parse uses its OWN bump (dropped when this returns): its
-    // intermediate owned strings need not outlive the copy below, which
-    // launders the kept ones into `ast.bump` (lifetime `'a`).
-    let scratch_bump = Bump::with_capacity(joined.len());
-    let mut scratch = Ast::with_capacity_for(joined.len(), &scratch_bump);
-    // Give the scratch parse the document's link reference definitions so a
-    // `[text][id]` on a de-prefixed line (a list/blockquote continuation that
-    // had to be joined into an owned buffer) still resolves. The def urls
-    // borrow `src`, which outlives `joined`, so they reborrow to `'j`.
-    scratch.link_defs = ast
-        .link_defs
-        .iter()
-        .map(|(k, &(url, title))| (k.clone(), (url, title)))
-        .collect();
-    let head = parse_spans(&mut scratch, joined)?;
-    Ok(copy_spans_owned(ast, &scratch, head))
-}
-
-/// Copy the span chain starting at `head` from `scratch` into `dst`,
-/// re-homing every text `Cow` into `dst`'s bump arena (a `Cow::Borrowed`
-/// with `dst`'s lifetime) so it no longer borrows `scratch`'s backing text.
-/// Returns the head index in `dst`.
-fn copy_spans_owned<'a>(dst: &mut Ast<'a>, scratch: &Ast<'_>, head: Option<u32>) -> Option<u32> {
-    let bump = dst.bump;
-    let mut chain = Chain::new();
-    let mut cur = head;
-    while let Some(idx) = cur {
-        let node = &scratch.spans[idx as usize];
-        let kind = match &node.kind {
-            SpanKind::Text(t) => SpanKind::Text(Cow::Borrowed(bump.alloc_str(t))),
-            SpanKind::Raw(t) => SpanKind::Raw(Cow::Borrowed(bump.alloc_str(t))),
-            SpanKind::Code(t) => SpanKind::Code(Cow::Borrowed(bump.alloc_str(t))),
-            SpanKind::Em(inner) => SpanKind::Em(copy_spans_owned(dst, scratch, *inner)),
-            SpanKind::Strong(inner) => SpanKind::Strong(copy_spans_owned(dst, scratch, *inner)),
-            SpanKind::Del(inner) => SpanKind::Del(copy_spans_owned(dst, scratch, *inner)),
-            SpanKind::Link { spans, href, title } => SpanKind::Link {
-                spans: copy_spans_owned(dst, scratch, *spans),
-                href: Cow::Borrowed(bump.alloc_str(href)),
-                title: title.as_ref().map(|t| Cow::Borrowed(bump.alloc_str(t))),
-            },
-            SpanKind::Image { src, alt, title } => SpanKind::Image {
-                src: Cow::Borrowed(bump.alloc_str(src)),
-                alt: Cow::Borrowed(bump.alloc_str(alt)),
-                title: title.as_ref().map(|t| Cow::Borrowed(bump.alloc_str(t))),
-            },
-        };
-        let new_idx = dst.push_span(kind);
-        chain.link(new_idx, |p, n| dst.spans[p as usize].next = Some(n));
-        cur = node.next;
-    }
-    chain.first()
-}
-
 /// Parse `joined` (a temporary `String` that does NOT outlive the AST) into
-/// block content in the main arena, deep-owning every `Cow` so nothing borrows
-/// the temporary. The block-level analogue of [`parse_spans_owned`] — used when
-/// a list item's content had to be rebuilt with owned strings (a TAB-indented
-/// continuation expanded to spaces).
-fn parse_blocks_owned<'a>(ast: &mut Ast<'a>, lines: &[&str], opts: &Options) -> Result<Option<u32>, Error> {
-    // Join into ONE contiguous buffer and re-split, so every line is a real
-    // sub-slice of `joined` and the scratch parse's offset/contiguity
-    // arithmetic holds. The result is deep-owned, so nothing borrows `joined`.
+/// the main arena. Used for the owned-text paragraph fallback (blockquote /
+/// list bodies whose de-prefixed source lines don't abut contiguously).
+///
+/// Re-homes the text into `ast.bump` ONCE (lifetime `'a`), then parses
+/// straight into `ast`: the produced spans borrow the bump copy, so there is
+/// no scratch [`Ast`] and no per-span copy — the parser's own borrowed-AST
+/// machinery does the work, with `ast`'s real `link_defs` in scope.
+fn parse_spans_owned<'a>(ast: &mut Ast<'a>, joined: &str) -> Result<Option<u32>, Error> {
+    let bump = ast.bump;
+    let j: &'a str = bump.alloc_str(joined);
+    parse_spans(ast, j)
+}
+
+/// Block-level analogue of [`parse_spans_owned`] — used when a list item's
+/// content had to be rebuilt with owned strings (a TAB-indented continuation
+/// expanded to spaces). Re-homes the joined buffer into `ast.bump`, re-splits
+/// it (so every line is a real sub-slice of the bump copy — the contiguity
+/// arithmetic holds), and parses directly into `ast`.
+fn parse_blocks_owned<'a>(
+    ast: &mut Ast<'a>,
+    lines: &[&str],
+    opts: &Options,
+) -> Result<Option<u32>, Error> {
     let joined: String = lines.join("\n");
-    let split: Vec<&str> = joined.split('\n').collect();
-    let scratch_bump = Bump::with_capacity(joined.len());
-    let mut scratch = Ast::with_capacity_for(joined.len(), &scratch_bump);
-    scratch.link_defs = ast
-        .link_defs
-        .iter()
-        .map(|(k, &(url, title))| (k.clone(), (url, title)))
-        .collect();
-    let head = parse_blocks(&mut scratch, &joined, &split, opts)?;
-    Ok(copy_blocks_owned(ast, &scratch, head))
-}
-
-/// Re-home an IAL list's keys into `bump` (used by [`copy_blocks_owned`]).
-/// Values stay owned `String`s — IALs are rare, so they keep the simple
-/// representation rather than threading the bump through their producers.
-fn own_ial<'a>(bump: &'a Bump, ial: &[(Cow<'_, str>, String)]) -> Vec<(Cow<'a, str>, String)> {
-    ial.iter()
-        .map(|(k, v)| (Cow::Borrowed(bump.alloc_str(k)), v.clone()))
-        .collect()
-}
-
-/// Copy the block chain at `head` from `scratch` into `dst`, deep-owning every
-/// `Cow` (text, ial, span/item children) so nothing borrows `scratch`. Returns
-/// the head index in `dst`.
-fn copy_blocks_owned<'a>(dst: &mut Ast<'a>, scratch: &Ast<'_>, head: Option<u32>) -> Option<u32> {
-    let bump = dst.bump;
-    let mut chain = Chain::new();
-    let mut cur = head;
-    while let Some(idx) = cur {
-        let node = &scratch.blocks[idx as usize];
-        let kind = match &node.kind {
-            BlockKind::Blank => BlockKind::Blank,
-            BlockKind::Hr => BlockKind::Hr,
-            BlockKind::Para(spans) => BlockKind::Para(copy_spans_owned(dst, scratch, *spans)),
-            BlockKind::Heading {
-                level,
-                raw,
-                span_text,
-                spans,
-            } => BlockKind::Heading {
-                level: *level,
-                raw: Cow::Borrowed(bump.alloc_str(raw)),
-                span_text: Cow::Borrowed(bump.alloc_str(span_text)),
-                spans: copy_spans_owned(dst, scratch, *spans),
-            },
-            BlockKind::Quote(inner) => BlockKind::Quote(copy_blocks_owned(dst, scratch, *inner)),
-            BlockKind::Code { lang, text } => BlockKind::Code {
-                lang: lang.as_ref().map(|l| Cow::Borrowed(bump.alloc_str(l))),
-                text: Cow::Borrowed(bump.alloc_str(text)),
-            },
-            BlockKind::RawHtml { html, md_spans } => BlockKind::RawHtml {
-                html: html.clone(),
-                md_spans: md_spans
-                    .iter()
-                    .map(|&h| copy_spans_owned(dst, scratch, h))
-                    .collect(),
-            },
-            BlockKind::List {
-                ordered,
-                loose,
-                items,
-                toc,
-            } => BlockKind::List {
-                ordered: *ordered,
-                loose: *loose,
-                items: copy_items_owned(dst, scratch, *items),
-                toc: *toc,
-            },
-            BlockKind::Table {
-                aligns,
-                header,
-                body,
-            } => BlockKind::Table {
-                aligns: aligns.clone(),
-                header: header
-                    .as_ref()
-                    .map(|h| h.iter().map(|&c| copy_spans_owned(dst, scratch, c)).collect()),
-                body: body
-                    .iter()
-                    .map(|row| row.iter().map(|&c| copy_spans_owned(dst, scratch, c)).collect())
-                    .collect(),
-            },
-        };
-        let new_idx = dst.push_block(kind);
-        dst.blocks[new_idx as usize].ial = own_ial(bump, &node.ial);
-        chain.link(new_idx, |p, n| dst.blocks[p as usize].next = Some(n));
-        cur = node.next;
-    }
-    chain.first()
-}
-
-/// Copy the item chain at `head` from `scratch` into `dst`, deep-owning every
-/// child block (see [`copy_blocks_owned`]). Returns the head index in `dst`.
-fn copy_items_owned<'a>(dst: &mut Ast<'a>, scratch: &Ast<'_>, head: Option<u32>) -> Option<u32> {
-    let mut chain = Chain::new();
-    let mut cur = head;
-    while let Some(idx) = cur {
-        let node = &scratch.items[idx as usize];
-        let blocks = copy_blocks_owned(dst, scratch, node.blocks);
-        let new_idx = dst.push_item(ItemNode {
-            blocks,
-            next: None,
-            transparent: node.transparent,
-            _marker: std::marker::PhantomData,
-        });
-        chain.link(new_idx, |p, n| dst.items[p as usize].next = Some(n));
-        cur = node.next;
-    }
-    chain.first()
+    let bump = ast.bump;
+    let j: &'a str = bump.alloc_str(&joined);
+    let split: Vec<&'a str> = j.split('\n').collect();
+    parse_blocks(ast, j, &split, opts)
 }
 
 /// If `b[i]` opens a well-formed inline HTML tag (`<` then a letter or `/`,
