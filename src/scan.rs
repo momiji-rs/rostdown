@@ -82,6 +82,31 @@ pub(crate) fn memchr3(hay: &[u8], a: u8, b: u8, c: u8) -> Option<usize> {
     None
 }
 
+/// Index of the first byte in `hay` equal to `a`, `b`, `c`, or `d` — a
+/// dependency-free `memchr4` (used for HTML *attribute* escaping, whose
+/// special set is `&`/`<`/`>`/`"`).
+#[inline]
+pub(crate) fn memchr4(hay: &[u8], a: u8, b: u8, c: u8, d: u8) -> Option<usize> {
+    let (ba, bb, bc, bd) = (broadcast(a), broadcast(b), broadcast(c), broadcast(d));
+    let mut i = 0;
+    while i + W <= hay.len() {
+        let w = usize::from_le_bytes(hay[i..i + W].try_into().unwrap());
+        let m = zero_lanes(w, ba) | zero_lanes(w, bb) | zero_lanes(w, bc) | zero_lanes(w, bd);
+        if m != 0 {
+            return Some(i + first_hit(m));
+        }
+        i += W;
+    }
+    while i < hay.len() {
+        let x = hay[i];
+        if x == a || x == b || x == c || x == d {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

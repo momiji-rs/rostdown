@@ -632,31 +632,26 @@ fn escape_text(out: &mut String, text: &str) {
 
 /// kramdown `escape_html(…, :attribute)` — also escapes `"`.
 fn escape_attr(out: &mut String, text: &str) {
+    // SWAR `memchr4` jumps to the next special byte (8/word) and the run
+    // before it is bulk-copied — link-heavy real content (clean hrefs with
+    // no specials) bails in one pass instead of a per-byte 4-way compare.
     let bytes = text.as_bytes();
     let mut start = 0;
-    while start < bytes.len() {
-        match bytes[start..]
-            .iter()
-            .position(|&b| matches!(b, b'&' | b'<' | b'>' | b'"'))
-        {
-            Some(off) => {
-                let i = start + off;
-                if off > 0 {
-                    out.push_str(&text[start..i]);
-                }
-                out.push_str(match bytes[i] {
-                    b'&' => "&amp;",
-                    b'<' => "&lt;",
-                    b'>' => "&gt;",
-                    _ => "&quot;",
-                });
-                start = i + 1;
-            }
-            None => {
-                out.push_str(&text[start..]);
-                break;
-            }
+    while let Some(off) = crate::scan::memchr4(&bytes[start..], b'&', b'<', b'>', b'"') {
+        let i = start + off;
+        if off > 0 {
+            out.push_str(&text[start..i]);
         }
+        out.push_str(match bytes[i] {
+            b'&' => "&amp;",
+            b'<' => "&lt;",
+            b'>' => "&gt;",
+            _ => "&quot;",
+        });
+        start = i + 1;
+    }
+    if start < bytes.len() {
+        out.push_str(&text[start..]);
     }
 }
 
